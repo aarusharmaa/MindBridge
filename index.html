@@ -3,36 +3,150 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MindBridge Lite</title>
-
-    <!-- MANDATORY: Tailwind CSS CDN for styling -->
-    <script src="https://cdn.tailwindcss.com"></script>
-
-    <!-- MANDATORY: Google Fonts - Inter for consistent typography -->
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
-
-    <!-- CRITICAL: Face-API.js CDN - This MUST be in the head and loaded first -->
-    <script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
-
-    <style>
-        /* Custom CSS for animations */
-        @keyframes fade-in {
-            from { opacity: 0; transform: translate(-50%, -20px); }
-            to { opacity: 1; transform: translate(-50%, 0); }
-        }
-        .animate-fade-in {
-            animation: fade-in 0.3s ease-out forwards;
-        }
-        body {
-            font-family: 'Inter', sans-serif;
-        }
-    </style>
+    <title>Adaptive Sign Language Translator</title>
+    <link rel="stylesheet" href="style.css">
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/holistic/holistic.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
 </head>
 <body>
-    <noscript>You need to enable JavaScript to run this app.</noscript>
-    <div id="root"></div>
+    <div class="floating-particles"></div>
+    
+    <div id="statusIndicator" class="status-indicator status-inactive">
+        📷 Camera Inactive
+    </div>
+    
+    <div class="container">
+        <div class="header">
+            <h1>Adaptive Sign Language Translator</h1>
+            <p class="subtitle">AI-Powered Bidirectional Communication Bridge</p>
+        </div>
 
-    <!-- Your React app bundle (e.g., index.js) - This should load AFTER face-api.js -->
-    <script src="index.js"></script>
+        <div class="user-selection">
+            <label style="color: white; font-weight: 600;">👤 Select User Profile:</label>
+            <select id="userSelect" class="user-select">
+                <option value="default">Default User</option>
+                <option value="user1">Alex Johnson</option>
+                <option value="user2">Maria Garcia</option>
+                <option value="user3">David Chen</option>
+                </select>
+        </div>
+
+        <div class="main-grid">
+            <div class="video-section">
+                <div class="video-container">
+                    <video id="videoElement" autoplay muted></video>
+                    <canvas id="canvasElement" class="canvas-overlay"></canvas>
+                </div>
+                <div class="controls">
+                    <button id="startBtn" class="btn btn-primary">🎥 Start Detection</button>
+                    <button id="stopBtn" class="btn btn-secondary" disabled>⏹️ Stop Detection</button>
+                    <button id="recordBtn" class="btn btn-accent" disabled>📹 Record Sign</button> <button id="speakBtn" class="btn btn-primary">🔊 Speak</button>
+                </div>
+                
+                <div class="stats-panel">
+                    <h4 style="color: white; margin-bottom: 15px; text-align: center;">📊 Session Statistics</h4>
+                    <div class="stats-grid">
+                        <div class="stat-item">
+                            <div class="stat-value" id="signsDetected">0</div>
+                            <div class="stat-label">Signs Detected</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-value" id="avgConfidence">0%</div>
+                            <div class="stat-label">Avg Confidence</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-value" id="phrasesCompleted">0</div>
+                            <div class="stat-label">Phrases</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-value" id="sessionTime">0:00</div>
+                            <div class="stat-label">Session Time</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="results-section">
+                <h3 style="color: white; margin-bottom: 20px; font-size: 1.4rem;">🎯 Recognition Results</h3>
+                <div id="resultsContainer">
+                    <div class="result-card">
+                        <div class="result-text">Ready to start...</div>
+                        <div class="confidence-section">
+                            <div class="confidence-bar">
+                                <div class="confidence-fill" style="width: 0%"></div>
+                            </div>
+                            <div class="confidence-text">
+                                <span>Confidence: 0%</span>
+                                <span>🤖 AI Learning</span>
+                            </div>
+                        </div>
+                        <div class="audio-controls">
+                            <button class="audio-btn" id="audioBtn">🔊</button>
+                            <div class="volume-control">
+                                <input type="range" id="volumeSlider" class="volume-slider" min="0" max="100" value="50">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="practice-mode">
+            <h3 style="color: white; margin-bottom: 20px; font-size: 1.4rem;">🔁 Reverse Translation & Practice Mode</h3>
+            <div class="practice-input">
+                <input type="text" class="input-field" id="practiceInput" placeholder="Enter text to see sign guide (e.g., hello, thank you)">
+                <button id="practiceBtn" class="btn btn-primary">Show Sign Guide</button>
+                <button id="practiceRecordBtn" class="btn btn-secondary" disabled>Record Practice</button> </div>
+            <div id="practiceResults"></div>
+        </div>
+
+        <div class="dataset-section">
+            <h3 style="color: white; margin-bottom: 20px; font-size: 1.4rem;">📁 Available Signs Dataset</h3>
+            <p style="color: rgba(255,255,255,0.8); margin-bottom: 15px;">Click on any sign to see its guide or practice it:</p>
+            <div class="dataset-grid" id="datasetGrid">
+                </div>
+        </div>
+
+        <div class="feature-cards">
+            <div class="feature-card">
+                <div class="feature-icon">🧠</div>
+                <div class="feature-title">Adaptive User Profiles</div>
+                <div class="feature-description">Simulated learning and improved recognition for each individual user's signing style over time. Personal gesture patterns enhance accuracy for diverse hand shapes and speeds. (Client-side simulation only)</div>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">🎯</div>
+                <div class="feature-title">Confidence-Based Feedback</div>
+                <div class="feature-description">Displays confidence scores and provides top 2-3 possible matches if confidence is low. Asks users to retry unclear signs for better accuracy.</div>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">💬</div>
+                <div class="feature-title">Context-Aware Phrases</div>
+                <div class="feature-description">Detects common multi-sign phrases and merges them into natural language flow. Reduces awkward pauses in communication. (Rule-based simulation only)</div>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">🔄</div>
+                <div class="feature-title">Bidirectional Translation</div>
+                <div class="feature-description">Text-to-sign visualizer with animated guides and hand skeleton overlays. Perfect for learning and teaching sign language interactively.</div>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">🔊</div>
+                <div class="feature-title">Text-to-Speech Integration</div>
+                <div class="feature-description">Converts recognized signs into spoken words in real-time. Supports both offline and online speech synthesis for accessibility.</div>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">👁️‍🗨️</div>
+                <div class="feature-title">Visual Feedback Overlay</div>
+                <div class="feature-description">Shows live hand skeletons using MediaPipe for gesture accuracy visualization with error highlights during practice.</div>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">🧩</div>
+                <div class="feature-title">Modular & Lightweight</div>
+                <div class="feature-description">Works offline with optimized performance. Easy to deploy on laptops or embedded systems. (No backend needed for core functionality)</div>
+            </div>
+        </div>
+    </div>
+    <script src="script.js"></script>
 </body>
 </html>
