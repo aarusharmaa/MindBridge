@@ -1,1106 +1,557 @@
-import React, { useState, useEffect, useRef, createContext, useContext, useCallback } from 'react';
-// face-api.js is assumed to be globally available via CDN script in HTML head
-// import * as faceapi from 'face-api.js'; // No longer imported directly in React
+// script.js
 
-import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, doc, getDoc, setDoc, updateDoc, onSnapshot, collection, addDoc, query, orderBy, limit } from 'firebase/firestore';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+// --- Global Variables ---
+const videoElement = document.getElementById('videoElement');
+const canvasElement = document.getElementById('canvasElement');
+const canvasCtx = canvasElement.getContext('2d');
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
+const recordBtn = document.getElementById('recordBtn'); // Placeholder, won't function without backend for saving
+const speakBtn = document.getElementById('speakBtn');
+const userSelect = document.getElementById('userSelect');
+const resultsContainer = document.getElementById('resultsContainer');
+const statusIndicator = document.getElementById('statusIndicator');
+const practiceInput = document.getElementById('practiceInput');
+const practiceBtn = document.getElementById('practiceBtn');
+const practiceRecordBtn = document.getElementById('practiceRecordBtn'); // Placeholder
+const practiceResults = document.getElementById('practiceResults');
+const datasetGrid = document.getElementById('datasetGrid');
+const audioBtn = document.getElementById('audioBtn');
+const volumeSlider = document.getElementById('volumeSlider');
 
-// NOTE: For this React app to run, ensure face-api.js and its models are loaded via CDN in your HTML file's <head>
-// Example (add these to your index.html or similar):
-// <script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
-// <script src="https://cdn.tailwindcss.com"></script>
-// <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
+// Stats elements
+const signsDetectedEl = document.getElementById('signsDetected');
+const avgConfidenceEl = document.getElementById('avgConfidence');
+const phrasesCompletedEl = document.getElementById('phrasesCompleted');
+const sessionTimeEl = document.getElementById('sessionTime');
 
+let mediaStream = null;
+let intervalId = null;
+let currentUserId = 'default'; // Current selected user (client-side only)
+let currentSign = 'Ready to start...';
+let currentConfidence = 0;
+let speakingRate = 1.0;
+let speakingPitch = 1.0;
+let lastSpokenText = '';
+let speechQueue = [];
+let isSpeaking = false;
 
-// --- Firebase Context and Provider ---
-const FirebaseContext = createContext(null);
+// Session stats
+let signsDetectedCount = 0;
+let totalConfidenceSum = 0;
+let phrasesCompletedCount = 0;
+let sessionStartTime = null;
+let sessionTimerInterval = null;
 
-const FirebaseProvider = ({ children }) => {
-    const [db, setDb] = useState(null);
-    const [auth, setAuth] = useState(null);
-    const [userId, setUserId] = useState(null);
-    const [isAuthReady, setIsAuthReady] = useState(false); // To ensure Firestore operations wait for auth
-
-    useEffect(() => {
-        try {
-            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-mindbridge-app-id';
-            const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
-
-            if (!firebaseConfig || Object.keys(firebaseConfig).length === 0) {
-                console.error("Firebase config not found. Please ensure __firebase_config is set.");
-                return;
-            }
-
-            const app = initializeApp(firebaseConfig);
-            const firestore = getFirestore(app);
-            const firebaseAuth = getAuth(app);
-
-            setDb(firestore);
-            setAuth(firebaseAuth);
-
-            const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
-
-            if (initialAuthToken) {
-                signInWithCustomToken(firebaseAuth, initialAuthToken)
-                    .then((userCredential) => {
-                        console.log("Signed in with custom token:", userCredential.user.uid);
-                    })
-                    .catch((error) => {
-                        console.error("Error signing in with custom token:", error);
-                        signInAnonymously(firebaseAuth)
-                            .then(() => console.log("Signed in anonymously as fallback."))
-                            .catch(anonError => console.error("Error signing in anonymously:", anonError));
-                    });
-            } else {
-                signInAnonymously(firebaseAuth)
-                    .then(() => console.log("Signed in anonymously."))
-                    .catch(error => console.error("Error signing in anonymously:", error));
-            }
-
-            const unsubscribe = onAuthStateChanged(firebaseAuth, (user) => {
-                if (user) {
-                    setUserId(user.uid);
-                    console.log("Auth state changed, user ID:", user.uid);
-                } else {
-                    setUserId(null);
-                    console.log("User logged out or no user.");
-                }
-                setIsAuthReady(true);
-            });
-
-            return () => unsubscribe();
-        } catch (e) {
-            console.error("Error initializing Firebase:", e);
-        }
-    }, []);
-
-    return (
-        <FirebaseContext.Provider value={{ db, auth, userId, isAuthReady }}>
-            {children}
-        </FirebaseContext.Provider>
-    );
-};
-
-// --- Custom Hook to use Firebase ---
-const useFirebase = () => {
-    return useContext(FirebaseContext);
-};
-
-// --- Message Box Component ---
-const MessageBox = ({ message, type, onClose }) => {
-    if (!message) return null;
-    const bgColor = type === 'success' ? 'bg-green-100 border-green-400 text-green-700' : 'bg-red-100 border-red-400 text-red-700';
-    const textColor = type === 'success' ? 'text-green-700' : 'text-red-700';
-
-    return (
-        <div className={`fixed top-4 left-1/2 -translate-x-1/2 px-6 py-3 rounded-lg shadow-lg border ${bgColor} z-50 flex items-center justify-between animate-fade-in`}>
-            <span className={textColor}>{message}</span>
-            <button
-                onClick={onClose}
-                className="ml-4 text-lg font-semibold leading-none text-gray-600 hover:text-gray-800"
-                aria-label="Close message"
-            >
-                &times;
-            </button>
-        </div>
-    );
-};
-
-// --- Header Component ---
-const Header = ({ currentPage, setCurrentPage, userId }) => {
-    return (
-        <header className="bg-gradient-to-r from-purple-700 to-indigo-700 shadow-lg py-4 px-6 rounded-b-xl">
-            <div className="container mx-auto flex flex-col md:flex-row justify-between items-center">
-                <h1 className="text-3xl font-extrabold text-white flex items-center mb-4 md:mb-0">
-                    <svg xmlns="http://www.w3.org/2000/svg" className="h-9 w-9 mr-3 text-pink-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M9.663 17h4.673M12 20v-3m0 0l.683-.566m-.683.566L11.317 17m0 0L8.683 17m3.317 0V7.5M12 21a9 9 0 110-18 9 9 0 010 18z" />
-                    </svg>
-                    MindBridge Lite
-                </h1>
-                <nav className="w-full md:w-auto">
-                    <ul className="flex justify-center md:justify-end space-x-4 md:space-x-6">
-                        <li><button onClick={() => setCurrentPage('dashboard')} className={`text-white hover:text-pink-200 font-medium transition duration-300 ease-in-out ${currentPage === 'dashboard' ? 'border-b-2 border-pink-300' : ''}`}>Dashboard</button></li>
-                        <li><button onClick={() => setCurrentPage('video-coach')} className={`text-white hover:text-pink-200 font-medium transition duration-300 ease-in-out ${currentPage === 'video-coach' ? 'border-b-2 border-pink-300' : ''}`}>Video Coach</button></li>
-                        <li><button onClick={() => setCurrentPage('chat-coach')} className={`text-white hover:text-pink-200 font-medium transition duration-300 ease-in-out ${currentPage === 'chat-coach' ? 'border-b-2 border-pink-300' : ''}`}>Chat Coach</button></li>
-                        <li><button onClick={() => setCurrentPage('journal')} className={`text-white hover:text-pink-200 font-medium transition duration-300 ease-in-out ${currentPage === 'journal' ? 'border-b-2 border-pink-300' : ''}`}>Emotion Journal</button></li>
-                        <li><button onClick={() => setCurrentPage('community')} className={`text-white hover:text-pink-200 font-medium transition duration-300 ease-in-out ${currentPage === 'community' ? 'border-b-2 border-pink-300' : ''}`}>Community</button></li>
-                        <li><button onClick={() => setCurrentPage('resources')} className={`text-white hover:text-pink-200 font-medium transition duration-300 ease-in-out ${currentPage === 'resources' ? 'border-b-2 border-pink-300' : ''}`}>Resources</button></li>
-                    </ul>
-                </nav>
-            </div>
-            {userId && (
-                <div className="container mx-auto text-center md:text-right mt-2 text-pink-100 text-sm">
-                    User ID: {userId}
-                </div>
-            )}
-        </header>
-    );
-};
-
-// --- Footer Component ---
-const Footer = () => {
-    return (
-        <footer className="bg-gray-800 text-white py-6 px-6 rounded-t-xl mt-8">
-            <div className="container mx-auto text-center text-sm">
-                <p>&copy; {new Date().getFullYear()} MindBridge Lite. All rights reserved.</p>
-                <p className="mt-2">Bridging communication gaps with AI empathy.</p>
-            </div>
-        </footer>
-    );
-};
-
-// --- Dashboard Component ---
-const DashboardPage = ({ userProfile, showMessage }) => {
-    const { db, userId, isAuthReady } = useFirebase();
-    const [mood, setMood] = useState('');
-    const [note, setNote] = useState('');
-    const [isSaving, setIsSaving] = useState(false);
-
-    const moods = ['Happy', 'Neutral', 'Sad', 'Anxious', 'Excited', 'Calm'];
-
-    const handleMoodCheckIn = async () => {
-        if (!mood || !db || !userId || !isAuthReady) {
-            showMessage('Please select a mood and ensure you are logged in.', 'error');
-            return;
-        }
-
-        setIsSaving(true);
-        try {
-            const journalCollectionRef = collection(db, `artifacts/${__app_id}/users/${userId}/emotionJournal`);
-            await addDoc(journalCollectionRef, {
-                mood: mood,
-                note: note,
-                timestamp: new Date().toISOString(),
-            });
-            showMessage('Mood check-in saved!', 'success');
-            setMood('');
-            setNote('');
-        } catch (error) {
-            console.error('Error saving mood check-in:', error);
-            showMessage('Failed to save mood check-in.', 'error');
-        } finally {
-            setIsSaving(false);
-        }
-    };
-
-    if (!userProfile) {
-        return (
-            <div className="flex justify-center items-center h-64 text-gray-600 text-xl">
-                Loading user profile...
-            </div>
-        );
+// --- Dummy AI Model (Client-Side JavaScript Version) ---
+// This class mimics the functionality of your Python Flask backend's DummySignClassifier.
+// All logic is now within the browser.
+class DummySignClassifierJS {
+    constructor() {
+        this.knownSigns = [
+            "hello", "thank_you", "yes", "no", "i_love_you", "help",
+            "water", "food", "good", "bad", "more", "please", "sorry",
+            "name", "home", "friends", "learn"
+        ];
+        // User profiles are now just for simulation of 'adaptive' behavior.
+        // Data is not persistently saved without a backend.
+        this.userProfiles = {
+            "default": { model_loaded: true, accuracy_bias: 0.0 },
+            "user1": { model_loaded: true, accuracy_bias: 0.1 }, // Alex Johnson
+            "user2": { model_loaded: true, accuracy_bias: 0.05 }, // Maria Garcia
+            "user3": { model_loaded: true, accuracy_bias: 0.15 } // David Chen
+        };
     }
 
-    return (
-        <div className="bg-white p-8 rounded-xl shadow-2xl w-full max-w-4xl mx-auto transform transition-all duration-500 ease-in-out hover:scale-[1.01]">
-            <h2 className="text-4xl font-extrabold text-center text-gray-800 mb-8">
-                Your MindBridge Dashboard
-            </h2>
+    loadUserProfile(userId) {
+        // Simulates loading a user profile. In a real app, this might load
+        // user-specific model parameters from IndexedDB or a server.
+        // For GitHub Pages, we just confirm it exists in our dummy data.
+        if (this.userProfiles[userId]) {
+            console.log(`DEBUG: Loaded dummy profile for user: ${userId}`);
+            return true;
+        } else {
+            console.warn(`DEBUG: Profile ${userId} not found. Using default behavior.`);
+            return false; // Profile not found in our pre-defined list
+        }
+    }
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mb-10">
-                {/* Quick Mood Check-in */}
-                <div className="bg-purple-50 p-6 rounded-lg shadow-md border border-purple-200">
-                    <h3 className="text-2xl font-semibold text-purple-700 mb-4">Quick Mood Check-in</h3>
-                    <div className="mb-4">
-                        <label htmlFor="moodSelect" className="block text-gray-700 text-lg font-medium mb-2">How are you feeling?</label>
-                        <select
-                            id="moodSelect"
-                            value={mood}
-                            onChange={(e) => setMood(e.target.value)}
-                            className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 transition duration-300"
-                        >
-                            <option value="">Select your mood</option>
-                            {moods.map(m => <option key={m} value={m}>{m}</option>)}
-                        </select>
-                    </div>
-                    <div className="mb-4">
-                        <label htmlFor="moodNote" className="block text-gray-700 text-lg font-medium mb-2">Optional Note:</label>
-                        <textarea
-                            id="moodNote"
-                            value={note}
-                            onChange={(e) => setNote(e.target.value)}
-                            placeholder="What's on your mind?"
-                            rows="3"
-                            className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 transition duration-300"
-                        ></textarea>
-                    </div>
-                    <button
-                        onClick={handleMoodCheckIn}
-                        disabled={!mood || isSaving}
-                        className="w-full bg-purple-600 text-white py-3 px-6 rounded-lg text-lg font-bold hover:bg-purple-700 focus:outline-none focus:ring-4 focus:ring-purple-300 transition duration-300 ease-in-out transform hover:scale-105 flex items-center justify-center"
-                    >
-                        {isSaving ? (
-                            <svg className="animate-spin h-6 w-6 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                            </svg>
-                        ) : (
-                            <>
-                                Save Mood Check-in
-                                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 ml-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
-                                </svg>
-                            </>
-                        )}
-                    </button>
-                </div>
+    // This is a DUMMY prediction based on random choice.
+    // In a real application, you would run a pre-trained TensorFlow.js model
+    // on the 'left_hand_landmarks' and 'right_hand_landmarks'.
+    predict(userId, leftHandLandmarks, rightHandLandmarks) {
+        if (!leftHandLandmarks && !rightHandLandmarks) {
+            return { sign: "No Hand Detected", confidence: 0, alternatives: [] };
+        }
 
-                {/* Quick Stats (Conceptual) */}
-                <div className="bg-pink-50 p-6 rounded-lg shadow-md border border-pink-200">
-                    <h3 className="text-2xl font-semibold text-pink-700 mb-4">Your Progress (Conceptual)</h3>
-                    <p className="text-gray-700 text-lg mb-2">
-                        This section would show trends from your Emotion Journal over time.
-                    </p>
-                    <ul className="list-disc list-inside text-gray-600 space-y-1">
-                        <li>Most frequent mood: <span className="font-semibold">{userProfile.mostFrequentMood || 'N/A'}</span></li>
-                        <li>Longest streak of positive moods: <span className="font-semibold">{userProfile.positiveStreak || 'N/A'}</span> days</li>
-                        <li>Conversation Coach usage: <span className="font-semibold">{userProfile.coachSessions || 'N/A'}</span> sessions</li>
-                    </ul>
-                    <p className="text-sm text-gray-500 mt-4">
-                        (These stats are conceptual for the hackathon and would require more complex data processing.)
-                    </p>
-                </div>
-            </div>
-        </div>
-    );
-};
+        const userBias = this.userProfiles[userId] ? this.userProfiles[userId].accuracy_bias : 0.0;
 
-// --- Video Coach Component ---
-const VideoCoachPage = ({ showMessage }) => {
-    const videoRef = useRef(null); // Changed from webcamRef
-    const canvasRef = useRef(null);
-    const [modelsLoaded, setModelsLoaded] = useState(false);
-    const [emotion, setEmotion] = useState('Neutral');
-    const [emotionScore, setEmotionScore] = useState(0);
-    const [isDetecting, setIsDetecting] = useState(false);
-    const detectionInterval = useRef(null);
+        // Simulate a prediction
+        const predictedSign = this.knownSigns[Math.floor(Math.random() * this.knownSigns.length)];
+        let confidence = Math.random() * (99 - 30) + 30; // Random confidence between 30 and 99
+        
+        // Apply user-specific "bias" to confidence
+        confidence = Math.max(0, confidence - (userBias * 100)); // Lower confidence slightly for higher bias
 
-    // Define the base URL for face-api.js models - CORRECTED PATH
-    const MODEL_URL = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights/';
-
-    // Load face-api.js models
-    useEffect(() => {
-        const loadModels = async () => {
-            // Ensure faceapi is globally available (loaded via CDN script tag)
-            if (typeof window.faceapi === 'undefined') {
-                showMessage('face-api.js not loaded. Please ensure the CDN script is in your HTML head.', 'error');
-                return;
-            }
-            showMessage('Loading AI models for emotion detection...', 'success');
-            try {
-                await window.faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
-                await window.faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL);
-                setModelsLoaded(true);
-                showMessage('AI models loaded successfully!', 'success');
-            } catch (error) {
-                console.error("Error loading face-api models:", error);
-                showMessage('Failed to load AI models. Please check console and ensure models are accessible.', 'error');
-            }
-        };
-        loadModels();
-    }, []);
-
-    // Handle webcam stream
-    useEffect(() => {
-        const getVideo = async () => {
-            if (videoRef.current) {
-                try {
-                    const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-                    videoRef.current.srcObject = stream;
-                } catch (err) {
-                    console.error("Error accessing webcam:", err);
-                    showMessage('Failed to access webcam. Please ensure camera permissions are granted.', 'error');
+        const alternatives = [];
+        if (confidence < 80) { // If confidence is low, suggest alternatives
+            const otherSigns = this.knownSigns.filter(s => s !== predictedSign);
+            const numAlternatives = Math.min(Math.floor(Math.random() * 3) + 1, otherSigns.length); // 1 to 3 alternatives
+            while (alternatives.length < numAlternatives) {
+                const alt = otherSigns[Math.floor(Math.random() * otherSigns.length)];
+                if (!alternatives.includes(alt)) {
+                    alternatives.push(alt);
                 }
             }
+        }
+
+        // Simulate context-aware phrase completion
+        let phraseCompletion = null;
+        if (predictedSign === "thank_you" && Math.random() > 0.7) {
+            phraseCompletion = "Thank you very much!";
+        } else if (predictedSign === "hello" && Math.random() > 0.7) {
+            phraseCompletion = "Hello there!";
+        } else if (predictedSign === "yes" && Math.random() > 0.6) {
+            phraseCompletion = "Yes, I agree!";
+        }
+
+        return {
+            sign: predictedSign,
+            confidence: parseFloat(confidence.toFixed(2)),
+            alternatives: alternatives,
+            phrase_completion: phraseCompletion
         };
-        getVideo();
+    }
 
-        // Cleanup stream on unmount
-        return () => {
-            if (videoRef.current && videoRef.current.srcObject) {
-                const stream = videoRef.current.srcObject;
-                const tracks = stream.getTracks();
-                tracks.forEach(track => track.stop());
-            }
-        };
-    }, []); // Run once on mount
+    getSignGuide(signText) {
+        // Dummy skeleton data for 21 landmarks (e.g., for one hand)
+        // These are normalized coordinates (0.0 to 1.0)
+        const dummySkeleton = [
+            [0.5, 0.5, 0.0], // Wrist
+            [0.4, 0.6, -0.1], [0.35, 0.65, -0.15], [0.3, 0.7, -0.2], [0.25, 0.75, -0.25], // Thumb
+            [0.6, 0.4, -0.05], [0.65, 0.3, -0.1], [0.7, 0.2, -0.15], [0.75, 0.1, -0.2], // Index
+            [0.55, 0.45, -0.05], [0.55, 0.35, -0.1], [0.55, 0.25, -0.15], [0.55, 0.15, -0.2], // Middle
+            [0.5, 0.4, -0.05], [0.45, 0.3, -0.1], [0.4, 0.2, -0.15], [0.35, 0.1, -0.2], // Ring
+            [0.45, 0.5, -0.05], [0.4, 0.4, -0.1], [0.35, 0.3, -0.15], [0.3, 0.2, -0.2]  // Pinky
+        ];
 
-    const startDetection = () => {
-        // Ensure window.faceapi is available before starting detection
-        if (typeof window.faceapi === 'undefined') {
-            showMessage('face-api.js not loaded. Cannot start detection.', 'error');
-            return;
-        }
-
-        if (!videoRef.current || !canvasRef.current || !modelsLoaded) {
-            showMessage('Webcam or models not ready.', 'error');
-            return;
-        }
-        setIsDetecting(true);
-        showMessage('Starting emotion detection...', 'success');
-
-        const video = videoRef.current;
-        const canvas = canvasRef.current;
-        const displaySize = { width: video.videoWidth, height: video.videoHeight };
-        window.faceapi.matchDimensions(canvas, displaySize);
-
-        detectionInterval.current = setInterval(async () => {
-            if (video.paused || video.ended) {
-                clearInterval(detectionInterval.current);
-                setIsDetecting(false);
-                return;
-            }
-
-            const detections = await window.faceapi.detectSingleFace(video, new window.faceapi.TinyFaceDetectorOptions()).withFaceExpressions();
-
-            if (detections) {
-                const resizedDetections = window.faceapi.resizeResults(detections, displaySize);
-                canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
-                // Draw bounding box (optional, can be removed for cleaner UI)
-                // window.faceapi.draw.drawDetections(canvas, resizedDetections);
-
-                const expressions = resizedDetections.expressions;
-                const sortedExpressions = Object.entries(expressions).sort(([, a], [, b]) => b - a);
-                const dominantEmotion = sortedExpressions[0][0];
-                const dominantScore = sortedExpressions[0][1];
-
-                setEmotion(dominantEmotion.charAt(0).toUpperCase() + dominantEmotion.slice(1)); // Capitalize
-                setEmotionScore(dominantScore);
-
-                // Draw emotion text
-                const text = `${dominantEmotion.charAt(0).toUpperCase() + dominantEmotion.slice(1)} (${(dominantScore * 100).toFixed(0)}%)`;
-                const box = resizedDetections.detection.box;
-                const drawBox = new window.faceapi.draw.DrawBox(box, { label: text, boxColor: '#8B5CF6' });
-                drawBox.draw(canvas);
-
-            } else {
-                setEmotion('No Face Detected');
-                setEmotionScore(0);
-                canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
-            }
-        }, 100); // Run detection every 100ms
-    };
-
-    const stopDetection = () => {
-        clearInterval(detectionInterval.current);
-        setIsDetecting(false);
-        setEmotion('Detection Stopped');
-        setEmotionScore(0);
-        if (canvasRef.current) {
-            canvasRef.current.getContext('2d').clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
-        }
-        showMessage('Emotion detection stopped.', 'success');
-    };
-
-    useEffect(() => {
-        return () => { // Cleanup on unmount
-            clearInterval(detectionInterval.current);
-        };
-    }, []);
-
-    return (
-        <div className="bg-white p-8 rounded-xl shadow-2xl w-full max-w-4xl mx-auto transform transition-all duration-500 ease-in-out hover:scale-[1.01]">
-            <h2 className="text-4xl font-extrabold text-center text-gray-800 mb-8">
-                Live Video Emotion Coach
-            </h2>
-            <p className="text-gray-600 text-center mb-6 text-lg">
-                Understand your own facial expressions in real-time. (Your video is processed locally and not stored.)
-            </p>
-
-            <div className="relative w-full aspect-video bg-gray-200 rounded-lg overflow-hidden mb-6 flex justify-center items-center">
-                {modelsLoaded ? (
-                    <>
-                        <video
-                            ref={videoRef}
-                            autoPlay
-                            muted
-                            playsInline
-                            className="absolute w-full h-full object-cover"
-                            // onUserMediaError handled in useEffect for getUserMedia
-                        />
-                        <canvas ref={canvasRef} className="absolute w-full h-full"></canvas>
-                    </>
-                ) : (
-                    <div className="flex flex-col items-center justify-center text-gray-500">
-                        <svg className="animate-spin h-10 w-10 text-purple-500 mb-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                        </svg>
-                        <p>Loading AI models...</p>
-                    </div>
-                )}
-            </div>
-
-            <div className="text-center mb-6">
-                <p className="text-2xl font-bold text-gray-700">
-                    Detected Emotion: <span className="text-purple-600">{emotion}</span>
-                </p>
-                {emotionScore > 0 && emotion !== 'No Face Detected' && (
-                    <p className="text-md text-gray-500">Confidence: {(emotionScore * 100).toFixed(0)}%</p>
-                )}
-            </div>
-
-            <div className="flex justify-center space-x-4">
-                {!isDetecting ? (
-                    <button
-                        onClick={startDetection}
-                        disabled={!modelsLoaded}
-                        className="bg-purple-600 text-white py-3 px-8 rounded-lg text-lg font-bold hover:bg-purple-700 focus:outline-none focus:ring-4 focus:ring-purple-300 transition duration-300 ease-in-out transform hover:scale-105 flex items-center justify-center"
-                    >
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                        </svg>
-                        Start Detection
-                    </button>
-                ) : (
-                    <button
-                        onClick={stopDetection}
-                        className="bg-red-600 text-white py-3 px-8 rounded-lg text-lg font-bold hover:bg-red-700 focus:outline-none focus:ring-4 focus:ring-red-300 transition duration-300 ease-in-out transform hover:scale-105 flex items-center justify-center"
-                    >
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z" />
-                        </svg>
-                        Stop Detection
-                    </button>
-                )}
-            </div>
-        </div>
-    );
-};
-
-// --- Chat Coach Component ---
-const ChatCoachPage = ({ showMessage }) => {
-    const { db, userId, isAuthReady } = useFirebase();
-    const [otherPersonMessage, setOtherPersonMessage] = useState('');
-    const [aiSuggestion, setAiSuggestion] = useState('');
-    const [isGenerating, setIsGenerating] = useState(false);
-    const [chatHistory, setChatHistory] = useState([]); // Stores { type: 'user'/'ai', text: '...' }
-    const chatHistoryRef = useRef(null); // Ref for scrolling chat to bottom
-
-    const [isListening, setIsListening] = useState(false);
-    const recognitionRef = useRef(null);
-    const synthRef = useRef(window.speechSynthesis);
-
-    const [selectedScenario, setSelectedScenario] = useState('');
-    const scenarios = [
-        { id: 'gratitude', name: 'Expressing Gratitude', initialPrompt: 'Someone did something kind for you. How would you thank them sincerely and appropriately?' },
-        { id: 'disagreement', name: 'Handling Disagreement', initialPrompt: 'You disagree with a friend\'s opinion. How can you express your view respectfully without causing offense?' },
-        { id: 'apology', name: 'Making an Apology', initialPrompt: 'You made a mistake and need to apologize. How can you genuinely express regret and offer to make amends?' },
-        { id: 'empathy', name: 'Showing Empathy', initialPrompt: 'A friend is feeling sad about a personal loss. How can you show empathy and offer support?' },
-    ];
-
-    // Scroll chat history to bottom
-    useEffect(() => {
-        if (chatHistoryRef.current) {
-            chatHistoryRef.current.scrollTop = chatHistoryRef.current.scrollHeight;
-        }
-    }, [chatHistory]);
-
-    // Initialize Speech Recognition
-    useEffect(() => {
-        if ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window) {
-            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-            recognitionRef.current = new SpeechRecognition();
-            recognitionRef.current.continuous = false; // Listen for a single utterance
-            recognitionRef.current.interimResults = false; // Only final results
-
-            recognitionRef.current.onstart = () => {
-                setIsListening(true);
-                showMessage('Listening for your message...', 'success');
-            };
-
-            recognitionRef.current.onresult = (event) => {
-                const transcript = event.results[0][0].transcript;
-                setOtherPersonMessage(transcript);
-                setIsListening(false);
-                showMessage('Speech recognized!', 'success');
-            };
-
-            recognitionRef.current.onerror = (event) => {
-                console.error('Speech recognition error:', event.error);
-                showMessage(`Speech recognition error: ${event.error}`, 'error');
-                setIsListening(false);
-            };
-
-            recognitionRef.current.onend = () => {
-                setIsListening(false);
+        if (this.knownSigns.includes(signText.toLowerCase().replace(/\s+/g, '_'))) {
+            return {
+                success: true,
+                description: `This is a placeholder guide for '${signText}'. In a full implementation, you'd see a detailed visual animation or step-by-step instructions on how to perform this sign. Practice slowly!`,
+                skeleton_data: dummySkeleton
             };
         } else {
-            console.warn('Speech Recognition not supported in this browser.');
-            showMessage('Speech Recognition not supported in your browser.', 'error');
+            return {
+                success: false,
+                message: `Sign '${signText}' not found in our current dataset. Try 'hello' or 'thank you' (case-insensitive)!`,
+                skeleton_data: []
+            };
         }
+    }
+}
 
-        return () => {
-            if (recognitionRef.current) {
-                recognitionRef.current.stop();
+// Instantiate our client-side dummy model
+const aiModelInstance = new DummySignClassifierJS();
+aiModelInstance.loadUserProfile("default"); // Load default profile on startup
+
+// --- Utility Functions ---
+
+function updateStatus(active) {
+    if (active) {
+        statusIndicator.textContent = '🟢 Camera Active';
+        statusIndicator.classList.remove('status-inactive');
+        statusIndicator.classList.add('status-active');
+    } else {
+        statusIndicator.textContent = '📷 Camera Inactive';
+        statusIndicator.classList.remove('status-active');
+        statusIndicator.classList.add('status-inactive');
+    }
+}
+
+function speakText(text) {
+    if (!text) return;
+
+    if (isSpeaking && text === lastSpokenText) {
+        return;
+    }
+
+    if ('speechSynthesis' in window) {
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.rate = speakingRate;
+        utterance.pitch = speakingPitch;
+        utterance.volume = volumeSlider.value / 100;
+        
+        utterance.onstart = () => { isSpeaking = true; };
+        utterance.onend = () => {
+            isSpeaking = false;
+            if (speechQueue.length > 0) {
+                const nextText = speechQueue.shift();
+                speakText(nextText);
             }
         };
-    }, []);
+        utterance.onerror = (event) => {
+            console.error('Speech synthesis error:', event.error);
+            isSpeaking = false;
+        };
 
-    const startListening = () => {
-        if (recognitionRef.current && !isListening) {
-            setOtherPersonMessage(''); // Clear previous input
-            recognitionRef.current.start();
+        if (!isSpeaking || text !== lastSpokenText) {
+            window.speechSynthesis.cancel();
+            window.speechSynthesis.speak(utterance);
+            lastSpokenText = text;
+        } else {
+            speechQueue.push(text);
         }
-    };
+    } else {
+        console.warn("Speech synthesis not supported in this browser.");
+    }
+}
 
-    const speakText = (text) => {
-        if (synthRef.current && text) {
-            const utterance = new SpeechSynthesisUtterance(text);
-            utterance.lang = 'en-US'; // Set language
-            synthRef.current.speak(utterance);
-        }
-    };
+function updateResultCard(signText, confidence, alternatives = [], phraseCompletion = null) {
+    if (signText === currentSign && Math.abs(confidence - currentConfidence) < 5 && !phraseCompletion) {
+        return;
+    }
 
-    const handleGetSuggestion = async () => {
-        if (!otherPersonMessage.trim() && !selectedScenario) {
-            showMessage('Please enter a message or select a scenario.', 'error');
-            return;
-        }
+    resultsContainer.innerHTML = `
+        <div class="result-card" style="animation-delay: 0s;">
+            <div class="result-text">${signText}</div>
+            <div class="confidence-section">
+                <div class="confidence-bar">
+                    <div class="confidence-fill" style="width: ${confidence}%"></div>
+                </div>
+                <div class="confidence-text">
+                    <span>Confidence: ${confidence.toFixed(1)}%</span>
+                    <span>${confidence >= 80 ? '✨ High Confidence' : (confidence >= 50 ? '🤖 AI Learning' : '🤔 Needs Clarity')}</span>
+                </div>
+            </div>
+            <div class="audio-controls">
+                <button class="audio-btn speak-current-result-btn">🔊</button>
+                <div class="volume-control">
+                    <input type="range" class="volume-slider" min="0" max="100" value="${volumeSlider.value}">
+                </div>
+            </div>
+            ${alternatives.length > 0 && confidence < 80 ? `
+                <div class="alternatives">
+                    <div class="alternatives-title">Did you mean?</div>
+                    <div class="alternatives-list">${alternatives.map(alt => `<span>${alt.replace(/_/g, ' ')}</span>`).join(', ')}</div>
+                </div>
+            ` : ''}
+            ${phraseCompletion ? `
+                <div class="phrase-completion">
+                    <div class="phrase-text">"<span>${phraseCompletion}</span>" detected!</div>
+                </div>
+            ` : ''}
+        </div>
+    `;
+    
+    currentSign = signText;
+    currentConfidence = confidence;
 
-        setIsGenerating(true);
-        setAiSuggestion(''); // Clear previous suggestion
-
-        // Add user message to history
-        const currentInput = selectedScenario ? `Scenario selected: ${scenarios.find(s => s.id === selectedScenario).name}` : otherPersonMessage;
-        setChatHistory(prev => [...prev, { type: 'user', text: currentInput }]);
-
-        // Prepare context for adaptive feedback
-        const recentChatContext = chatHistory.slice(-5).map(msg => `${msg.type === 'user' ? 'Other Person' : 'AI'}: ${msg.text}`).join('\n');
-        const basePrompt = selectedScenario
-            ? scenarios.find(s => s.id === selectedScenario).initialPrompt
-            : `The other person just said: "${otherPersonMessage}".`;
-
-        const fullPrompt = `You are an AI conversation coach for someone who struggles with social cues.
-        ${recentChatContext ? `Recent conversation context:\n${recentChatContext}\n` : ''}
-        ${basePrompt}
-        Suggest a polite, appropriate, and empathetic response. Focus on acknowledging their statement and offering a clear, concise reply. Provide only the suggested response, without any introductory or concluding remarks.`;
-
-        let geminiChatHistory = [];
-        geminiChatHistory.push({ role: "user", parts: [{ text: fullPrompt }] });
-        const payload = { contents: geminiChatHistory };
-        const apiKey = ""; // Canvas will provide this in runtime
-        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
-
-        try {
-            const response = await fetch(apiUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            const result = await response.json();
-
-            if (result.candidates && result.candidates.length > 0 &&
-                result.candidates[0].content && result.candidates[0].content.parts &&
-                result.candidates[0].content.parts.length > 0) {
-                const text = result.candidates[0].content.parts[0].text;
-                setAiSuggestion(text);
-                setChatHistory(prev => [...prev, { type: 'ai', text: text }]);
-                showMessage('AI suggestion generated!', 'success');
-            } else {
-                setAiSuggestion('Could not generate a suggestion. Please try again.');
-                showMessage('Failed to generate AI suggestion.', 'error');
+    const speakCurrentResultBtn = resultsContainer.querySelector('.speak-current-result-btn');
+    if (speakCurrentResultBtn) {
+        speakCurrentResultBtn.onclick = () => {
+            const textToSpeak = phraseCompletion || signText;
+            if (textToSpeak && textToSpeak !== 'Ready to start...' && textToSpeak !== 'No Hand Detected') {
+                 speakText(textToSpeak);
             }
-        } catch (error) {
-            console.error('Error calling Gemini API:', error);
-            showMessage('Error generating AI suggestion. Please check your connection.', 'error');
-        } finally {
-            setIsGenerating(false);
-            setOtherPersonMessage(''); // Clear input after getting suggestion
-            setSelectedScenario(''); // Clear selected scenario
-        }
-    };
-
-    return (
-        <div className="bg-white p-8 rounded-xl shadow-2xl w-full max-w-3xl mx-auto transform transition-all duration-500 ease-in-out hover:scale-[1.01]">
-            <h2 className="text-4xl font-extrabold text-center text-gray-800 mb-8">
-                AI Conversation Coach
-            </h2>
-            <p className="text-gray-600 text-center mb-6 text-lg">
-                Practice social responses. Enter what the other person said, or choose a scenario.
-            </p>
-
-            {/* Guided Practice Scenarios */}
-            <div className="mb-8 p-6 bg-blue-50 rounded-lg border border-blue-200">
-                <h3 className="text-2xl font-semibold text-blue-700 mb-4">Guided Practice Scenarios</h3>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {scenarios.map(scenario => (
-                        <button
-                            key={scenario.id}
-                            onClick={() => {
-                                setSelectedScenario(scenario.id);
-                                setOtherPersonMessage(''); // Clear any manual input
-                                showMessage(`Scenario selected: ${scenario.name}`, 'success');
-                            }}
-                            className={`px-4 py-2 rounded-lg font-medium transition duration-300 ${selectedScenario === scenario.id ? 'bg-blue-600 text-white' : 'bg-blue-100 text-blue-800 hover:bg-blue-200'} shadow-md`}
-                        >
-                            {scenario.name}
-                        </button>
-                    ))}
-                </div>
-                {selectedScenario && (
-                    <p className="mt-4 text-gray-700">
-                        Selected: <span className="font-semibold">{scenarios.find(s => s.id === selectedScenario)?.name}</span>.
-                        Click "Get Suggestion" to start.
-                    </p>
-                )}
-            </div>
-
-            <div ref={chatHistoryRef} className="border border-gray-200 rounded-lg p-4 mb-6 h-80 overflow-y-auto bg-gray-50 shadow-inner">
-                {chatHistory.length === 0 ? (
-                    <p className="text-gray-400 text-center py-10">Conversation history will appear here.</p>
-                ) : (
-                    chatHistory.map((msg, index) => (
-                        <div key={index} className={`mb-3 p-3 rounded-lg max-w-[80%] ${msg.type === 'user' ? 'bg-indigo-100 ml-auto text-right' : 'bg-purple-100 mr-auto text-left'}`}>
-                            <p className={`font-semibold ${msg.type === 'user' ? 'text-indigo-800' : 'text-purple-800'}`}>
-                                {msg.type === 'user' ? 'Other Person:' : 'AI Suggestion:'}
-                            </p>
-                            <p className="text-gray-800">{msg.text}</p>
-                            {msg.type === 'ai' && (
-                                <button
-                                    onClick={() => speakText(msg.text)}
-                                    className="mt-2 text-sm text-purple-600 hover:text-purple-800 flex items-center"
-                                >
-                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                                        <path strokeLinecap="round" strokeLinejoin="round" d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1V9a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.107 12 5v14c0 .893-1.077 1.337-1.707.707L5.586 15z" />
-                                    </svg>
-                                    Listen
-                                </button>
-                            )}
-                        </div>
-                    ))
-                )}
-            </div>
-
-            <div className="mb-6">
-                <label htmlFor="otherPersonMessage" className="block text-gray-700 text-lg font-medium mb-2">What did the other person say?</label>
-                <div className="flex space-x-2">
-                    <textarea
-                        id="otherPersonMessage"
-                        value={otherPersonMessage}
-                        onChange={(e) => {
-                            setOtherPersonMessage(e.target.value);
-                            setSelectedScenario(''); // Clear scenario if user types
-                        }}
-                        placeholder="e.g., 'I'm feeling a bit down today, my dog is sick.'"
-                        rows="3"
-                        className="flex-grow px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 transition duration-300"
-                        disabled={isGenerating || isListening}
-                    ></textarea>
-                    <button
-                        onClick={startListening}
-                        disabled={isListening || isGenerating}
-                        className={`p-3 rounded-lg text-white transition duration-300 ${isListening ? 'bg-red-500' : 'bg-green-500 hover:bg-green-600'} focus:outline-none focus:ring-4 focus:ring-green-300`}
-                        title={isListening ? "Stop Listening" : "Start Listening"}
-                    >
-                        {isListening ? (
-                            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                                <path strokeLinecap="round" strokeLinejoin="round" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                                <path strokeLinecap="round" strokeLinejoin="round" d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z" />
-                            </svg>
-                        ) : (
-                            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                                <path strokeLinecap="round" strokeLinejoin="round" d="M19 11a7 7 0 01-14 0v-1a7 7 0 0114 0v1z" />
-                                <path strokeLinecap="round" strokeLinejoin="round" d="M10 21h4a2 2 0 002-2v-1a2 2 0 00-2-2h-4a2 2 0 00-2 2v1a2 2 0 002 2z" />
-                            </svg>
-                        )}
-                    </button>
-                </div>
-            </div>
-
-            <button
-                onClick={handleGetSuggestion}
-                disabled={isGenerating || (!otherPersonMessage.trim() && !selectedScenario)}
-                className="w-full bg-indigo-600 text-white py-3 px-6 rounded-lg text-lg font-bold hover:bg-indigo-700 focus:outline-none focus:ring-4 focus:ring-indigo-300 transition duration-300 ease-in-out transform hover:scale-105 flex items-center justify-center"
-            >
-                {isGenerating ? (
-                    <svg className="animate-spin h-6 w-6 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                    </svg>
-                ) : (
-                    <>
-                        Get Suggestion
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 ml-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
-                        </svg>
-                    </>
-                )}
-            </button>
-        </div>
-    );
-};
-
-// --- Emotion Journal Dashboard Component ---
-const EmotionJournalPage = () => {
-    const { db, userId, isAuthReady } = useFirebase();
-    const [journalEntries, setJournalEntries] = useState([]);
-    const [isLoadingJournal, setIsLoadingJournal] = useState(true);
-
-    // Map mood strings to numerical values for charting
-    const moodToValue = {
-        'Happy': 5,
-        'Excited': 4.5,
-        'Calm': 4,
-        'Neutral': 3,
-        'Anxious': 2,
-        'Sad': 1,
-    };
-
-    useEffect(() => {
-        if (!db || !userId || !isAuthReady) return;
-
-        const journalCollectionRef = collection(db, `artifacts/${__app_id}/users/${userId}/emotionJournal`);
-        const q = query(journalCollectionRef, orderBy('timestamp', 'desc'), limit(30)); // Last 30 entries for chart
-
-        const unsubscribe = onSnapshot(q, (snapshot) => {
-            const fetchedEntries = snapshot.docs.map(doc => ({
-                id: doc.id,
-                ...doc.data(),
-                timestamp: doc.data().timestamp ? new Date(doc.data().timestamp) : new Date() // Parse to Date object
-            }));
-            setJournalEntries(fetchedEntries);
-            setIsLoadingJournal(false);
-        }, (error) => {
-            console.error("Error fetching journal entries:", error);
-            setIsLoadingJournal(false);
-        });
-
-        return () => unsubscribe();
-    }, [db, userId, isAuthReady]);
-
-    // Prepare data for Recharts
-    const chartData = journalEntries.map(entry => ({
-        date: entry.timestamp.toLocaleDateString(), // Format for X-axis
-        moodValue: moodToValue[entry.mood] || 3, // Default to Neutral if mood not mapped
-        moodLabel: entry.mood,
-    })).reverse(); // Reverse to show chronological order on chart
-
-    if (isLoadingJournal) {
-        return (
-            <div className="flex justify-center items-center h-64 text-gray-600 text-xl">
-                Loading journal entries...
-            </div>
-        );
+        };
     }
-
-    return (
-        <div className="bg-white p-8 rounded-xl shadow-2xl w-full max-w-5xl mx-auto transform transition-all duration-500 ease-in-out hover:scale-[1.01]">
-            <h2 className="text-4xl font-extrabold text-center text-gray-800 mb-8">
-                Your Emotion Journal & Trends
-            </h2>
-
-            {journalEntries.length === 0 ? (
-                <div className="text-center text-gray-500 text-lg py-10">
-                    No journal entries yet. Check in your mood from the Dashboard to see trends!
-                </div>
-            ) : (
-                <>
-                    {/* Mood Trend Chart */}
-                    <div className="mb-10 p-6 bg-indigo-50 rounded-lg shadow-md border border-indigo-200">
-                        <h3 className="text-2xl font-semibold text-indigo-700 mb-4">Mood Trends Over Time</h3>
-                        <ResponsiveContainer width="100%" height={300}>
-                            <LineChart
-                                data={chartData}
-                                margin={{ top: 5, right: 30, left: 20, bottom: 5 }}
-                            >
-                                <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
-                                <XAxis dataKey="date" />
-                                <YAxis domain={[0, 5.5]} ticks={[1, 2, 3, 4, 5]} tickFormatter={(value) => Object.keys(moodToValue).find(key => moodToValue[key] === value) || ''} />
-                                <Tooltip formatter={(value, name, props) => [props.payload.moodLabel, 'Mood']} />
-                                <Line type="monotone" dataKey="moodValue" stroke="#8884d8" activeDot={{ r: 8 }} />
-                            </LineChart>
-                        </ResponsiveContainer>
-                        <p className="text-center text-gray-600 text-sm mt-4">
-                            (Higher values indicate more positive moods. Y-axis labels are conceptual moods.)
-                        </p>
-                    </div>
-
-                    {/* Recent Entries List */}
-                    <div className="mb-10 p-6 bg-blue-50 rounded-lg shadow-md border border-blue-200">
-                        <h3 className="text-2xl font-semibold text-blue-700 mb-4">Recent Entries</h3>
-                        <div className="space-y-4">
-                            {journalEntries.map(entry => (
-                                <div key={entry.id} className="bg-white p-5 rounded-lg shadow-sm border border-blue-100 hover:shadow-md transition-shadow duration-300">
-                                    <p className="text-lg font-semibold text-blue-700 mb-1">Mood: {entry.mood}</p>
-                                    {entry.note && <p className="text-gray-700 mb-1">Note: {entry.note}</p>}
-                                    <p className="text-sm text-gray-500">Time: {entry.timestamp.toLocaleString()}</p> {/* FIX: Convert Date object to string */}
-                                </div>
-                            ))}
-                        </div>
-                    </div>
-                </>
-            )}
-        </div>
-    );
-};
-
-// --- Community Forum Component ---
-const CommunityPage = ({ showMessage }) => {
-    const { db, userId, isAuthReady } = useFirebase();
-    const [posts, setPosts] = useState([]);
-    const [newPostContent, setNewPostContent] = useState('');
-    const [isPosting, setIsPosting] = useState(false);
-    const [isLoadingPosts, setIsLoadingPosts] = useState(true);
-
-    useEffect(() => {
-        if (!db || !isAuthReady) return;
-
-        const postsCollectionRef = collection(db, `artifacts/${__app_id}/public/data/communityPosts`);
-        const q = query(postsCollectionRef, orderBy('timestamp', 'desc'), limit(50)); // Last 50 posts
-
-        const unsubscribe = onSnapshot(q, (snapshot) => {
-            const fetchedPosts = snapshot.docs.map(doc => ({
-                id: doc.id,
-                ...doc.data(),
-                timestamp: doc.data().timestamp ? new Date(doc.data().timestamp).toLocaleString() : 'N/A'
-            }));
-            setPosts(fetchedPosts);
-            setIsLoadingPosts(false);
-        }, (error) => {
-            console.error("Error fetching community posts:", error);
-            showMessage('Failed to load community posts.', 'error');
-            setIsLoadingPosts(false);
-        });
-
-        return () => unsubscribe();
-    }, [db, isAuthReady, showMessage]);
-
-    const handleAddPost = async () => {
-        if (!newPostContent.trim() || !db || !userId || !isAuthReady) {
-            showMessage('Please enter content for your post and ensure you are logged in.', 'error');
-            return;
-        }
-
-        setIsPosting(true);
-        try {
-            const postsCollectionRef = collection(db, `artifacts/${__app_id}/public/data/communityPosts`);
-            await addDoc(postsCollectionRef, {
-                authorId: userId, // Using userId for author
-                content: newPostContent,
-                timestamp: new Date().toISOString(),
-            });
-            showMessage('Post added successfully!', 'success');
-            setNewPostContent('');
-        } catch (error) {
-            console.error('Error adding post:', error);
-            showMessage('Failed to add post. Please try again.', 'error');
-        } finally {
-            setIsPosting(false);
-        }
-    };
-
-    if (isLoadingPosts) {
-        return (
-            <div className="flex justify-center items-center h-64 text-gray-600 text-xl">
-                Loading community forum...
-            </div>
-        );
+    const newVolumeSlider = resultsContainer.querySelector('.volume-slider');
+    if (newVolumeSlider) {
+        newVolumeSlider.oninput = (e) => {
+            volumeSlider.value = e.target.value;
+        };
     }
+}
 
-    return (
-        <div className="bg-white p-8 rounded-xl shadow-2xl w-full max-w-4xl mx-auto transform transition-all duration-500 ease-in-out hover:scale-[1.01]">
-            <h2 className="text-4xl font-extrabold text-center text-gray-800 mb-8">
-                Community Forum
-            </h2>
-            <p className="text-gray-600 text-center mb-6 text-lg">
-                Connect with others, share experiences, and offer support.
-            </p>
+function updateSessionStats() {
+    signsDetectedEl.textContent = signsDetectedCount;
+    avgConfidenceEl.textContent = signsDetectedCount > 0 ? `${(totalConfidenceSum / signsDetectedCount).toFixed(0)}%` : '0%';
+    phrasesCompletedEl.textContent = phrasesCompletedCount;
 
-            {/* New Post Section */}
-            <div className="mb-8 p-6 bg-green-50 rounded-lg shadow-md border border-green-200">
-                <h3 className="text-2xl font-semibold text-green-700 mb-4">Create New Post</h3>
-                <textarea
-                    value={newPostContent}
-                    onChange={(e) => setNewPostContent(e.target.value)}
-                    placeholder="Share your thoughts or ask a question..."
-                    rows="4"
-                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 transition duration-300 mb-4"
-                    disabled={isPosting}
-                ></textarea>
-                <button
-                    onClick={handleAddPost}
-                    disabled={isPosting || !newPostContent.trim()}
-                    className="w-full bg-green-600 text-white py-3 px-6 rounded-lg text-lg font-bold hover:bg-green-700 focus:outline-none focus:ring-4 focus:ring-green-300 transition duration-300 ease-in-out transform hover:scale-105 flex items-center justify-center"
-                >
-                    {isPosting ? (
-                        <svg className="animate-spin h-6 w-6 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                        </svg>
-                    ) : (
-                        <>
-                            Post to Forum
-                            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 ml-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                                <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
-                            </svg>
-                        </>
-                    )}
-                </button>
-            </div>
+    if (sessionStartTime) {
+        const elapsedSeconds = Math.floor((Date.now() - sessionStartTime) / 1000);
+        const minutes = Math.floor(elapsedSeconds / 60);
+        const seconds = elapsedSeconds % 60;
+        sessionTimeEl.textContent = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+    }
+}
 
-            {/* Existing Posts */}
-            <div className="space-y-6">
-                {posts.length === 0 ? (
-                    <div className="text-center text-gray-500 text-lg py-10">
-                        No posts yet. Be the first to share!
-                    </div>
-                ) : (
-                    posts.map(post => (
-                        <div key={post.id} className="bg-gray-50 p-6 rounded-lg shadow-sm border border-gray-200 hover:shadow-md transition-shadow duration-300">
-                            <p className="text-gray-800 text-lg mb-2 leading-relaxed">{post.content}</p>
-                            <p className="text-sm text-gray-500">
-                                Posted by: <span className="font-semibold">{post.authorId.substring(0, 8)}...</span> on {post.timestamp}
-                            </p>
-                            <p className="text-xs text-gray-400 mt-1">
-                                (Full User ID: {post.authorId})
-                            </p>
+// --- Client-Side AI Logic (MediaPipe Processing & Dummy Prediction) ---
+const holistic = new Holistic({
+    locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/holistic/${file}`;
+    }
+});
+
+holistic.onResults((results) => {
+    canvasCtx.save();
+    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+    canvasCtx.scale(-1, 1); // Mirror horizontally
+    canvasCtx.drawImage(results.image, -canvasElement.width, 0, canvasElement.width, canvasElement.height);
+    canvasCtx.restore();
+
+    drawConnectors(canvasCtx, results.leftHandLandmarks, HAND_CONNECTIONS, { color: '#00FF00', lineWidth: 5 });
+    drawLandmarks(canvasCtx, results.leftHandLandmarks, { color: '#FF0000', lineWidth: 2 });
+    drawConnectors(canvasCtx, results.rightHandLandmarks, HAND_CONNECTIONS, { color: '#00FF00', lineWidth: 5 });
+    drawLandmarks(canvasCtx, results.rightHandLandmarks, { color: '#FF0000', lineWidth: 2 });
+
+    // Use the client-side dummy AI model for prediction
+    // MediaPipe landmarks are already in the format needed [x, y, z] for each landmark
+    // so no need for .map(l => [l.x, l.y, l.z])
+    const prediction = aiModelInstance.predict(currentUserId, results.leftHandLandmarks, results.rightHandLandmarks);
+
+    if (prediction.sign) {
+        updateResultCard(prediction.sign.replace(/_/g, ' '), prediction.confidence, prediction.alternatives, prediction.phrase_completion);
+
+        const textToSpeak = prediction.phrase_completion || prediction.sign.replace(/_/g, ' ');
+
+        if (textToSpeak && textToSpeak !== lastSpokenText && prediction.confidence > 60) {
+            speakText(textToSpeak);
+            lastSpokenText = textToSpeak;
+        }
+
+        if (prediction.sign !== 'No Hand Detected' && prediction.sign !== 'Ready to start...' && prediction.sign !== currentSign) {
+            signsDetectedCount++;
+            totalConfidenceSum += prediction.confidence;
+            if (prediction.phrase_completion) {
+                phrasesCompletedCount++;
+            }
+            updateSessionStats();
+        }
+        currentSign = prediction.sign;
+    }
+});
+
+
+// --- Webcam Control ---
+async function startWebcam() {
+    try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ video: true });
+        videoElement.srcObject = mediaStream;
+        videoElement.play();
+        videoElement.onloadedmetadata = () => {
+            canvasElement.width = videoElement.videoWidth;
+            canvasElement.height = videoElement.videoHeight;
+        };
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await holistic.send({ image: videoElement });
+            },
+            width: 640,
+            height: 480
+        });
+        camera.start();
+
+        sessionStartTime = Date.now();
+        sessionTimerInterval = setInterval(updateSessionStats, 1000);
+
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        updateStatus(true);
+    } catch (err) {
+        console.error("Error accessing webcam:", err);
+        updateStatus(false);
+        alert("Could not access webcam. Please ensure it's connected and permissions are granted. Error: " + err.message);
+    }
+}
+
+function stopWebcam() {
+    if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+        videoElement.srcObject = null;
+        mediaStream = null;
+    }
+    if (sessionTimerInterval) {
+        clearInterval(sessionTimerInterval);
+    }
+    sessionStartTime = null;
+    signsDetectedCount = 0;
+    totalConfidenceSum = 0;
+    phrasesCompletedCount = 0;
+    updateSessionStats();
+
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    updateStatus(false);
+    updateResultCard("Ready to start...", 0);
+}
+
+// --- Event Listeners ---
+startBtn.addEventListener('click', startWebcam);
+stopBtn.addEventListener('click', stopWebcam);
+speakBtn.addEventListener('click', () => {
+    const textToSpeak = currentSign;
+    if (textToSpeak && textToSpeak !== 'Ready to start...' && textToSpeak !== 'No Hand Detected') {
+        speakText(textToSpeak);
+    }
+});
+
+audioBtn.addEventListener('click', () => {
+    const textToSpeak = currentSign;
+    if (textToSpeak && textToSpeak !== 'Ready to start...' && textToSpeak !== 'No Hand Detected') {
+        speakText(textToSpeak);
+    }
+});
+
+volumeSlider.addEventListener('input', (e) => {
+    console.log('Volume set to:', e.target.value);
+});
+
+userSelect.addEventListener('change', (event) => {
+    currentUserId = event.target.value;
+    // Client-side simulation of user profile loading
+    const success = aiModelInstance.loadUserProfile(currentUserId);
+    if (success) {
+        console.log(`Client-side: Switched to user: ${currentUserId}`);
+        updateResultCard(`Switched to ${userSelect.options[userSelect.selectedIndex].text} profile.`, 0);
+    } else {
+        console.warn(`Client-side: Profile ${currentUserId} not found. Using default simulation.`);
+        updateResultCard(`Profile for ${userSelect.options[userSelect.selectedIndex].text} not found. Using default simulation.`, 0);
+    }
+});
+
+
+// --- Practice Mode Logic ---
+practiceBtn.addEventListener('click', () => {
+    const textToGuide = practiceInput.value.trim();
+    if (textToGuide) {
+        // Call the client-side dummy model for guide data
+        const guideData = aiModelInstance.getSignGuide(textToGuide);
+        
+        if (guideData.success) {
+            practiceResults.innerHTML = `
+                <div class="practice-guide">
+                    <div class="guide-title">Guide for: "${textToGuide}"</div>
+                    <div class="guide-description">${guideData.description}</div>
+                    ${guideData.skeleton_data && guideData.skeleton_data.length > 0 ? `
+                        <div class="hand-skeleton" id="livePracticeSkeleton">
+                            <div class="skeleton-overlay"></div>
+                            <canvas id="practiceCanvas" style="position:absolute; top:0; left:0;"></canvas>
                         </div>
-                    ))
-                )}
-            </div>
-        </div>
-    );
-};
-
-// --- Resources Page (Conceptual Professional Integration) ---
-const ResourcesPage = () => {
-    return (
-        <div className="bg-white p-8 rounded-xl shadow-2xl w-full max-w-4xl mx-auto transform transition-all duration-500 ease-in-out hover:scale-[1.01]">
-            <h2 className="text-4xl font-extrabold text-center text-gray-800 mb-8">
-                Professional Resources & Support
-            </h2>
-            <p className="text-gray-600 text-center mb-6 text-lg">
-                MindBridge Lite aims to connect you with professional support when needed.
-            </p>
-
-            <div className="space-y-8">
-                <div className="bg-red-50 p-6 rounded-lg shadow-md border border-red-200">
-                    <h3 className="text-2xl font-semibold text-red-700 mb-4">Connect with a Therapist/Coach (Conceptual)</h3>
-                    <p className="text-gray-700 mb-4">
-                        In a full version of MindBridge Lite, you would be able to securely connect with licensed therapists or communication coaches. This could include:
-                    </p>
-                    <ul className="list-disc list-inside text-gray-600 space-y-2">
-                        <li>Secure video call scheduling and sessions.</li>
-                        <li>Option to share your Emotion Journal trends (with your explicit consent).</li>
-                        <li>Direct messaging for quick check-ins.</li>
-                        <li>Personalized exercises and homework assigned by your professional.</li>
-                    </ul>
-                    <button className="mt-6 bg-red-600 text-white py-3 px-6 rounded-lg text-lg font-bold hover:bg-red-700 focus:outline-none focus:ring-4 focus:ring-red-300 transition duration-300 ease-in-out transform hover:scale-105">
-                        Find a Professional (Coming Soon)
-                    </button>
+                    ` : ''}
                 </div>
+            `;
 
-                <div className="bg-yellow-50 p-6 rounded-lg shadow-md border border-yellow-200">
-                    <h3 className="text-2xl font-semibold text-yellow-700 mb-4">Educational Articles & Workshops</h3>
-                    <p className="text-gray-700 mb-4">
-                        Access curated articles, videos, and online workshops on topics related to neurodiversity, communication skills, emotional regulation, and social interaction.
-                    </p>
-                    <ul className="list-disc list-inside text-gray-600 space-y-2">
-                        <li>Understanding Non-Verbal Cues</li>
-                        <li>Active Listening Techniques</li>
-                        <li>Managing Social Anxiety</li>
-                        <li>Building Meaningful Relationships</li>
-                    </ul>
-                    <button className="mt-6 bg-yellow-600 text-white py-3 px-6 rounded-lg text-lg font-bold hover:bg-yellow-700 focus:outline-none focus:ring-4 focus:ring-yellow-300 transition duration-300 ease-in-out transform hover:scale-105">
-                        Explore Learning Resources (Coming Soon)
-                    </button>
-                </div>
-            </div>
-        </div>
-    );
-};
-
-
-// --- Main App Component ---
-const App = () => {
-    const { db, userId, isAuthReady } = useFirebase();
-    const [currentPage, setCurrentPage] = useState('dashboard');
-    const [userProfile, setUserProfile] = useState(null);
-    const [message, setMessage] = useState('');
-    const [messageType, setMessageType] = useState('');
-
-    const showMessage = (msg, type) => {
-        setMessage(msg);
-        setMessageType(type);
-        const timer = setTimeout(() => {
-            setMessage('');
-            setMessageType('');
-        }, 5000);
-        return () => clearTimeout(timer);
-    };
-
-    // Fetch or create user profile in Firestore
-    useEffect(() => {
-        if (!db || !userId || !isAuthReady) return;
-
-        const userDocRef = doc(db, `artifacts/${__app_id}/users/${userId}/profile/data`);
-
-        const unsubscribe = onSnapshot(userDocRef, async (docSnap) => {
-            if (docSnap.exists()) {
-                setUserProfile(docSnap.data());
-                console.log("User profile loaded:", docSnap.data());
-            } else {
-                const defaultProfile = {
-                    username: `User_${userId.substring(0, 6)}`,
-                    mostFrequentMood: 'N/A', // Conceptual for hackathon
-                    positiveStreak: 0, // Conceptual for hackathon
-                    coachSessions: 0, // Conceptual for hackathon
-                };
-                try {
-                    await setDoc(userDocRef, defaultProfile);
-                    setUserProfile(defaultProfile);
-                    showMessage('Welcome! Your MindBridge Lite profile has been created.', 'success');
-                    console.log("New user profile created.");
-                } catch (error) {
-                    console.error("Error creating user profile:", error);
-                    showMessage('Failed to create user profile.', 'error');
+            if (guideData.skeleton_data && guideData.skeleton_data.length > 0) {
+                const practiceCanvas = document.getElementById('practiceCanvas');
+                if (practiceCanvas) {
+                    practiceCanvas.width = videoElement.videoWidth > 0 ? videoElement.videoWidth : 640;
+                    practiceCanvas.height = videoElement.videoHeight > 0 ? videoElement.videoHeight : 480;
+                    const ctx = practiceCanvas.getContext('2d');
+                    ctx.translate(practiceCanvas.width, 0);
+                    ctx.scale(-1, 1);
+                    drawSkeletonOnCanvas(ctx, guideData.skeleton_data, practiceCanvas.width, practiceCanvas.height);
                 }
             }
-        }, (error) => {
-            console.error("Error fetching user profile:", error);
-            showMessage('Error loading user profile.', 'error');
+        } else {
+            practiceResults.innerHTML = `<div class="result-card" style="border-left-color: orange;">${guideData.message}</div>`;
+        }
+    } else {
+        practiceResults.innerHTML = `<div class="result-card" style="border-left-color: orange;">Please enter text to get a sign guide.</div>`;
+    }
+});
+
+// Function to draw a hand skeleton on a canvas (for practice guide)
+function drawSkeletonOnCanvas(ctx, landmarks, width, height) {
+    if (!landmarks || landmarks.length === 0) return;
+
+    const points = landmarks.map(lm => ({ x: lm[0] * width, y: lm[1] * height }));
+
+    const connections = [
+        [0, 1], [1, 2], [2, 3], [3, 4], // Thumb
+        [0, 5], [5, 6], [6, 7], [7, 8], // Index finger
+        [9, 10], [10, 11], [11, 12],     // Middle finger
+        [13, 14], [14, 15], [15, 16],    // Ring finger
+        [17, 18], [18, 19], [19, 20],    // Pinky finger
+        [0, 9], [9, 13], [13, 17], [0, 17] // Palm base connections
+    ];
+
+    ctx.clearRect(0, 0, width, height);
+    
+    ctx.strokeStyle = 'blue';
+    ctx.lineWidth = 2;
+    connections.forEach(conn => {
+        const p1 = points[conn[0]];
+        const p2 = points[conn[1]];
+        if (p1 && p2) {
+            ctx.beginPath();
+            ctx.moveTo(p1.x, p1.y);
+            ctx.lineTo(p2.x, p2.y);
+            ctx.stroke();
+        }
+    });
+
+    points.forEach(p => {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 5, 0, 2 * Math.PI);
+        ctx.fillStyle = 'red';
+        ctx.fill();
+    });
+}
+
+
+// --- Dataset Population (Dummy) ---
+const dummySigns = [
+    { name: "Hello", emoji: "👋" },
+    { name: "Thank You", emoji: "🙏" },
+    { name: "Yes", emoji: "👍" },
+    { name: "No", emoji: "👎" },
+    { name: "I Love You", emoji: "🤟" },
+    { name: "Help", emoji: "🆘" },
+    { name: "Water", emoji: "💧" },
+    { name: "Food", emoji: "🍔" },
+    { name: "Good", emoji: "✅" },
+    { name: "Bad", emoji: "❌" },
+    { name: "More", emoji: "➕" },
+    { name: "Please", emoji: "🥺" },
+    { name: "Sorry", emoji: "😔" },
+    { name: "Name", emoji: "🏷️" },
+    { name: "Home", emoji: "🏠" },
+    { name: "Friends", emoji: "🤝" },
+    { name: "Learn", emoji: "📚" }
+];
+
+function populateDatasetGrid() {
+    datasetGrid.innerHTML = '';
+    dummySigns.forEach(sign => {
+        const signCard = document.createElement('div');
+        signCard.className = 'sign-card';
+        signCard.innerHTML = `
+            <div class="sign-emoji">${sign.emoji}</div>
+            <div class="sign-name">${sign.name}</div>
+        `;
+        signCard.addEventListener('click', () => {
+            practiceInput.value = sign.name;
+            practiceBtn.click();
         });
+        datasetGrid.appendChild(signCard);
+    });
+}
 
-        return () => unsubscribe();
-    }, [db, userId, isAuthReady]);
+// --- Floating Particles Effect ---
+function createParticles() {
+    const container = document.querySelector('.floating-particles');
+    for (let i = 0; i < 30; i++) {
+        const particle = document.createElement('div');
+        particle.className = 'particle';
+        const size = Math.random() * 15 + 5;
+        particle.style.width = `${size}px`;
+        particle.style.height = `${size}px`;
+        particle.style.left = `${Math.random() * 100}%`;
+        particle.style.top = `${Math.random() * 100}%`;
+        particle.style.animationDuration = `${Math.random() * 10 + 5}s`;
+        particle.style.animationDelay = `${Math.random() * 5}s`;
+        container.appendChild(particle);
+    }
+}
 
-    return (
-        <div className="min-h-screen bg-gradient-to-br from-indigo-50 to-purple-100 font-inter flex flex-col">
-            <Header currentPage={currentPage} setCurrentPage={setCurrentPage} userId={userId} />
-            <MessageBox message={message} type={messageType} onClose={() => setMessage('')} />
-
-            <main className="flex-grow container mx-auto px-4 py-8 flex items-center justify-center">
-                {!isAuthReady ? (
-                    <div className="flex justify-center items-center h-64 text-gray-600 text-xl">
-                        Initializing MindBridge Lite...
-                    </div>
-                ) : (
-                    <>
-                        {currentPage === 'dashboard' && <DashboardPage userProfile={userProfile} showMessage={showMessage} />}
-                        {currentPage === 'video-coach' && <VideoCoachPage showMessage={showMessage} />}
-                        {currentPage === 'chat-coach' && <ChatCoachPage showMessage={showMessage} />}
-                        {currentPage === 'journal' && <EmotionJournalPage />}
-                        {currentPage === 'community' && <CommunityPage showMessage={showMessage} />}
-                        {currentPage === 'resources' && <ResourcesPage />}
-                    </>
-                )}
-            </main>
-
-            <Footer />
-        </div>
-    );
-};
-
-// Wrap the App component with FirebaseProvider
-const RootApp = () => (
-    <FirebaseProvider>
-        <App />
-    </FirebaseProvider>
-);
-
-export default RootApp;
+// --- Initial Setup ---
+document.addEventListener('DOMContentLoaded', () => {
+    updateStatus(false);
+    populateDatasetGrid();
+    createParticles();
+    holistic.initialize();
+    updateSessionStats();
+});
