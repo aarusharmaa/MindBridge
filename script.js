@@ -43,18 +43,142 @@ let phrasesCompletedCount = 0;
 let sessionStartTime = null;
 let sessionTimerInterval = null;
 
-// --- Dummy AI Model (Client-Side JavaScript Version) ---
-// This class mimics the functionality of your Python Flask backend's DummySignClassifier.
-// All logic is now within the browser.
-class DummySignClassifierJS {
+// --- Helper Functions for Landmark Analysis ---
+
+// Calculate Euclidean distance between two 3D points
+function calculateDistance(p1, p2) {
+    if (!p1 || !p2) return Infinity;
+    return Math.sqrt(
+        Math.pow(p1.x - p2.x, 2) +
+        Math.pow(p1.y - p2.y, 2) +
+        Math.pow(p1.z - p2.z, 2)
+    );
+}
+
+// Calculate the bounding box height of fingers (excluding wrist/palm base)
+function getFingerHeight(landmarks) {
+    if (!landmarks || landmarks.length < 21) return 0;
+    const fingerTips = [landmarks[8], landmarks[12], landmarks[16], landmarks[20]]; // Index, Middle, Ring, Pinky tips
+    const lowestY = Math.max(...fingerTips.map(p => p.y));
+    const highestY = Math.min(...fingerTips.map(p => p.y));
+    return lowestY - highestY;
+}
+
+// --- Rule-Based Sign Recognition Functions ---
+
+function detectHello(handLandmarks) {
+    if (!handLandmarks || handLandmarks.length === 0) return false;
+
+    // Check if hand is open (fingers extended)
+    const wrist = handLandmarks[0];
+    const indexTip = handLandmarks[8];
+    const middleTip = handLandmarks[12];
+    const ringTip = handLandmarks[16];
+    const pinkyTip = handLandmarks[20];
+    const thumbTip = handLandmarks[4];
+
+    // Check if fingers are relatively straight and extended
+    const finger_tip_y_diff_threshold = 0.08; // Small diff means fingers are aligned
+    const index_middle_y_diff = Math.abs(indexTip.y - middleTip.y);
+    const middle_ring_y_diff = Math.abs(middleTip.y - ringTip.y);
+    const ring_pinky_y_diff = Math.abs(ringTip.y - pinkyTip.y);
+
+    const fingers_straight = (
+        index_middle_y_diff < finger_tip_y_diff_threshold &&
+        middle_ring_y_diff < finger_tip_y_diff_threshold &&
+        ring_pinky_y_diff < finger_tip_y_diff_threshold
+    );
+
+    // Check if fingers are generally above wrist (open hand gesture)
+    const fingers_above_wrist = (
+        indexTip.y < wrist.y && middleTip.y < wrist.y &&
+        ringTip.y < wrist.y && pinkyTip.y < wrist.y &&
+        thumbTip.y < wrist.y
+    );
+
+    // Check thumb extension relative to palm/index finger
+    const thumb_dist_to_index_base = calculateDistance(handLandmarks[5], thumbTip);
+    const thumb_dist_to_wrist = calculateDistance(wrist, thumbTip);
+
+    // This is a rough heuristic: thumb should be somewhat extended, not tucked in
+    const thumb_extended = thumb_dist_to_index_base > calculateDistance(handLandmarks[5], handLandmarks[6]) * 0.8;
+    const thumb_not_tucked_in = thumbTip.x > wrist.x; // Simplified: thumb typically to the right for right hand
+
+    return fingers_straight && fingers_above_wrist && thumb_extended && thumb_not_tucked_in;
+}
+
+function detectYes(handLandmarks) {
+    if (!handLandmarks || handLandmarks.length === 0) return false;
+
+    const thumbTip = handLandmarks[4];
+    const thumbBase = handLandmarks[3];
+    const indexKnuckle = handLandmarks[5]; // Base of index finger
+
+    // Thumb extended upwards
+    const isThumbUp = thumbTip.y < thumbBase.y && thumbTip.y < indexKnuckle.y;
+
+    // Other fingers curled (simplified: their tips are below their respective bases/knuckles)
+    const indexTip = handLandmarks[8];
+    const middleTip = handLandmarks[12];
+    const ringTip = handLandmarks[16];
+    const pinkyTip = handLandmarks[20];
+
+    const fingersCurled = (
+        indexTip.y > handLandmarks[6].y && // index tip below its knuckle
+        middleTip.y > handLandmarks[10].y && // middle tip below its knuckle
+        ringTip.y > handLandmarks[14].y && // ring tip below its knuckle
+        pinkyTip.y > handLandmarks[18].y   // pinky tip below its knuckle
+    );
+
+    // Check if thumb is sufficiently separated from other fingers
+    const thumbSeparation = calculateDistance(thumbTip, indexKnuckle);
+    const thumbToPalmBase = calculateDistance(handLandmarks[0], indexKnuckle); // Distance from wrist to index knuckle
+    const thumbIsOut = thumbSeparation > thumbToPalmBase * 0.5; // Heuristic for thumb being out
+
+    return isThumbUp && fingersCurled && thumbIsOut;
+}
+
+function detectNo(handLandmarks) {
+    if (!handLandmarks || handLandmarks.length === 0) return false;
+
+    const thumbTip = handLandmarks[4];
+    const thumbBase = handLandmarks[3];
+    const wrist = handLandmarks[0];
+
+    // Thumb extended downwards
+    const isThumbDown = thumbTip.y > thumbBase.y && thumbTip.y > wrist.y;
+
+    // Other fingers curled (same logic as 'yes')
+    const indexTip = handLandmarks[8];
+    const middleTip = handLandmarks[12];
+    const ringTip = handLandmarks[16];
+    const pinkyTip = handLandmarks[20];
+
+    const fingersCurled = (
+        indexTip.y > handLandmarks[6].y &&
+        middleTip.y > handLandmarks[10].y &&
+        ringTip.y > handLandmarks[14].y &&
+        pinkyTip.y > handLandmarks[18].y
+    );
+
+    // Check if thumb is sufficiently separated from other fingers (similar to 'yes')
+    const thumbSeparation = calculateDistance(thumbTip, handLandmarks[5]); // Dist to index base
+    const thumbToPalmBase = calculateDistance(wrist, handLandmarks[5]);
+    const thumbIsOut = thumbSeparation > thumbToPalmBase * 0.5;
+
+    return isThumbDown && fingersCurled && thumbIsOut;
+}
+
+
+// --- Client-Side AI Model (Hybrid: Rule-Based + Dummy) ---
+// This class now incorporates rule-based detection for specific signs.
+class SignRecognizer {
     constructor() {
         this.knownSigns = [
             "hello", "thank_you", "yes", "no", "i_love_you", "help",
             "water", "food", "good", "bad", "more", "please", "sorry",
             "name", "home", "friends", "learn"
         ];
-        // User profiles are now just for simulation of 'adaptive' behavior.
-        // Data is not persistently saved without a backend.
         this.userProfiles = {
             "default": { model_loaded: true, accuracy_bias: 0.0 },
             "user1": { model_loaded: true, accuracy_bias: 0.1 }, // Alex Johnson
@@ -64,69 +188,83 @@ class DummySignClassifierJS {
     }
 
     loadUserProfile(userId) {
-        // Simulates loading a user profile. In a real app, this might load
-        // user-specific model parameters from IndexedDB or a server.
-        // For GitHub Pages, we just confirm it exists in our dummy data.
         if (this.userProfiles[userId]) {
             console.log(`DEBUG: Loaded dummy profile for user: ${userId}`);
             return true;
         } else {
             console.warn(`DEBUG: Profile ${userId} not found. Using default behavior.`);
-            return false; // Profile not found in our pre-defined list
+            return false;
         }
     }
 
-    // This is a DUMMY prediction based on random choice.
-    // In a real application, you would run a pre-trained TensorFlow.js model
-    // on the 'left_hand_landmarks' and 'right_hand_landmarks'.
     predict(userId, leftHandLandmarks, rightHandLandmarks) {
-        if (!leftHandLandmarks && !rightHandLandmarks) {
-            return { sign: "No Hand Detected", confidence: 0, alternatives: [] };
+        let recognizedSign = "No Hand Detected";
+        let confidence = 0;
+        let alternatives = [];
+        let phraseCompletion = null;
+
+        // --- Priority 1: Rule-Based Recognition (for specific, distinct signs) ---
+        // Prefer right hand if present, otherwise left.
+        const activeHand = rightHandLandmarks && rightHandLandmarks.length > 0 ? rightHandLandmarks : leftHandLandmarks;
+
+        if (activeHand && activeHand.length > 0) {
+            if (detectHello(activeHand)) {
+                recognizedSign = "hello";
+                confidence = 95; // High confidence for rule-based match
+            } else if (detectYes(activeHand)) {
+                recognizedSign = "yes";
+                confidence = 95;
+            } else if (detectNo(activeHand)) {
+                recognizedSign = "no";
+                confidence = 95;
+            }
         }
 
-        const userBias = this.userProfiles[userId] ? this.userProfiles[userId].accuracy_bias : 0.0;
+        // --- Priority 2: Fallback to Random Prediction for other signs ---
+        // If no specific rule-based sign was detected, use the old random logic
+        if (recognizedSign === "No Hand Detected" || recognizedSign === "Ready to start...") {
+            const userBias = this.userProfiles[userId] ? this.userProfiles[userId].accuracy_bias : 0.0;
+            const predictedRandomSign = this.knownSigns[Math.floor(Math.random() * this.knownSigns.length)];
+            let randomConfidence = Math.random() * (99 - 30) + 30; // Random confidence between 30 and 99
+            randomConfidence = Math.max(0, randomConfidence - (userBias * 100));
 
-        // Simulate a prediction
-        const predictedSign = this.knownSigns[Math.floor(Math.random() * this.knownSigns.length)];
-        let confidence = Math.random() * (99 - 30) + 30; // Random confidence between 30 and 99
-        
-        // Apply user-specific "bias" to confidence
-        confidence = Math.max(0, confidence - (userBias * 100)); // Lower confidence slightly for higher bias
+            recognizedSign = predictedRandomSign;
+            confidence = parseFloat(randomConfidence.toFixed(2));
 
-        const alternatives = [];
-        if (confidence < 80) { // If confidence is low, suggest alternatives
-            const otherSigns = this.knownSigns.filter(s => s !== predictedSign);
-            const numAlternatives = Math.min(Math.floor(Math.random() * 3) + 1, otherSigns.length); // 1 to 3 alternatives
-            while (alternatives.length < numAlternatives) {
-                const alt = otherSigns[Math.floor(Math.random() * otherSigns.length)];
-                if (!alternatives.includes(alt)) {
-                    alternatives.push(alt);
+            if (confidence < 80) {
+                const otherSigns = this.knownSigns.filter(s => s !== predictedRandomSign);
+                const numAlternatives = Math.min(Math.floor(Math.random() * 3) + 1, otherSigns.length);
+                while (alternatives.length < numAlternatives) {
+                    const alt = otherSigns[Math.floor(Math.random() * otherSigns.length)];
+                    if (!alternatives.includes(alt)) {
+                        alternatives.push(alt);
+                    }
                 }
             }
         }
 
-        // Simulate context-aware phrase completion
-        let phraseCompletion = null;
-        if (predictedSign === "thank_you" && Math.random() > 0.7) {
+        // --- Phrase Completion (can apply to both rule-based and random) ---
+        if (recognizedSign === "thank_you" && Math.random() > 0.7) {
             phraseCompletion = "Thank you very much!";
-        } else if (predictedSign === "hello" && Math.random() > 0.7) {
+        } else if (recognizedSign === "hello" && Math.random() > 0.7) {
             phraseCompletion = "Hello there!";
-        } else if (predictedSign === "yes" && Math.random() > 0.6) {
+        } else if (recognizedSign === "yes" && Math.random() > 0.6) {
             phraseCompletion = "Yes, I agree!";
         }
 
         return {
-            sign: predictedSign,
-            confidence: parseFloat(confidence.toFixed(2)),
+            sign: recognizedSign,
+            confidence: confidence,
             alternatives: alternatives,
             phrase_completion: phraseCompletion
         };
     }
 
+    // Updated getSignGuide for more specific descriptions
     getSignGuide(signText) {
-        // Dummy skeleton data for 21 landmarks (e.g., for one hand)
-        // These are normalized coordinates (0.0 to 1.0)
-        const dummySkeleton = [
+        const lowerSignText = signText.toLowerCase().replace(/\s+/g, '_');
+        let description = `This is a placeholder guide for '${signText}'. In a full implementation, you'd see a detailed visual animation or step-by-step instructions. Practice slowly!`;
+        const dummySkeleton = [ // Generic hand-open pose for visual reference
             [0.5, 0.5, 0.0], // Wrist
             [0.4, 0.6, -0.1], [0.35, 0.65, -0.15], [0.3, 0.7, -0.2], [0.25, 0.75, -0.25], // Thumb
             [0.6, 0.4, -0.05], [0.65, 0.3, -0.1], [0.7, 0.2, -0.15], [0.75, 0.1, -0.2], // Index
@@ -135,24 +273,48 @@ class DummySignClassifierJS {
             [0.45, 0.5, -0.05], [0.4, 0.4, -0.1], [0.35, 0.3, -0.15], [0.3, 0.2, -0.2]  // Pinky
         ];
 
-        if (this.knownSigns.includes(signText.toLowerCase().replace(/\s+/g, '_'))) {
+        // Custom descriptions for known signs
+        switch (lowerSignText) {
+            case "hello":
+                description = "For 'Hello', raise an open hand to your side, palm facing forward, and move it slightly side to side as if waving. Ensure your fingers are together and extended.";
+                break;
+            case "thank_you":
+                description = "To sign 'Thank You', touch your fingertips to your chin and then move your hand forward and down in a graceful arc, extending your arm. Keep your palm open and fingers straight.";
+                break;
+            case "yes":
+                description = "To sign 'Yes', form a fist and quickly move your hand up and down, as if nodding your head. Keep your thumb extended upwards.";
+                break;
+            case "no":
+                description = "To sign 'No', form a fist with your thumb extended downwards and quickly move your hand up and down, as if shaking your head. Ensure your other fingers are curled into your palm.";
+                break;
+            case "i_love_you":
+                description = "For 'I Love You', extend your thumb, index finger, and pinky finger, while curling your middle and ring fingers into your palm. This forms a unique shape.";
+                break;
+            case "help":
+                description = "To sign 'Help', place your non-dominant hand flat, palm up. Place your dominant fist on top, thumb up, and lift both hands upwards. This signifies lifting someone up.";
+                break;
+            // Add more specific descriptions for other signs as desired
+        }
+
+
+        if (this.knownSigns.includes(lowerSignText)) {
             return {
                 success: true,
-                description: `This is a placeholder guide for '${signText}'. In a full implementation, you'd see a detailed visual animation or step-by-step instructions on how to perform this sign. Practice slowly!`,
+                description: description,
                 skeleton_data: dummySkeleton
             };
         } else {
             return {
                 success: false,
-                message: `Sign '${signText}' not found in our current dataset. Try 'hello' or 'thank you' (case-insensitive)!`,
+                message: `Sign '${signText}' not found in our current dataset. Try 'hello', 'yes', or 'thank you'!`,
                 skeleton_data: []
             };
         }
     }
 }
 
-// Instantiate our client-side dummy model
-const aiModelInstance = new DummySignClassifierJS();
+// Instantiate our client-side hybrid model
+const aiModelInstance = new SignRecognizer();
 aiModelInstance.loadUserProfile("default"); // Load default profile on startup
 
 // --- Utility Functions ---
@@ -171,10 +333,6 @@ function updateStatus(active) {
 
 function speakText(text) {
     if (!text) return;
-
-    if (isSpeaking && text === lastSpokenText) {
-        return;
-    }
 
     if ('speechSynthesis' in window) {
         const utterance = new SpeechSynthesisUtterance(text);
@@ -195,19 +353,25 @@ function speakText(text) {
             isSpeaking = false;
         };
 
-        if (!isSpeaking || text !== lastSpokenText) {
-            window.speechSynthesis.cancel();
+        // If the same text is spoken again, or if it's already speaking something else, queue it.
+        // Otherwise, clear current speech and speak immediately.
+        if (isSpeaking && text === lastSpokenText) {
+             // Do nothing, already speaking this
+        } else if (isSpeaking) {
+            speechQueue.push(text);
+        } else {
+            window.speechSynthesis.cancel(); // Stop any current speech
             window.speechSynthesis.speak(utterance);
             lastSpokenText = text;
-        } else {
-            speechQueue.push(text);
         }
     } else {
         console.warn("Speech synthesis not supported in this browser.");
     }
 }
 
+
 function updateResultCard(signText, confidence, alternatives = [], phraseCompletion = null) {
+    // Only update if the sign or confidence changed significantly, or if there's a phrase completion
     if (signText === currentSign && Math.abs(confidence - currentConfidence) < 5 && !phraseCompletion) {
         return;
     }
@@ -277,7 +441,7 @@ function updateSessionStats() {
     }
 }
 
-// --- Client-Side AI Logic (MediaPipe Processing & Dummy Prediction) ---
+// --- MediaPipe Processing & Sign Recognition ---
 const holistic = new Holistic({
     locateFile: (file) => {
         return `https://cdn.jsdelivr.net/npm/@mediapipe/holistic/${file}`;
@@ -291,267 +455,20 @@ holistic.onResults((results) => {
     canvasCtx.drawImage(results.image, -canvasElement.width, 0, canvasElement.width, canvasElement.height);
     canvasCtx.restore();
 
-    drawConnectors(canvasCtx, results.leftHandLandmarks, HAND_CONNECTIONS, { color: '#00FF00', lineWidth: 5 });
-    drawLandmarks(canvasCtx, results.leftHandLandmarks, { color: '#FF0000', lineWidth: 2 });
-    drawConnectors(canvasCtx, results.rightHandLandmarks, HAND_CONNECTIONS, { color: '#00FF00', lineWidth: 5 });
-    drawLandmarks(canvasCtx, results.rightHandLandmarks, { color: '#FF0000', lineWidth: 2 });
+    // Draw hand landmarks only if they are detected
+    if (results.leftHandLandmarks) {
+        drawConnectors(canvasCtx, results.leftHandLandmarks, HAND_CONNECTIONS, { color: '#00FF00', lineWidth: 5 });
+        drawLandmarks(canvasCtx, results.leftHandLandmarks, { color: '#FF0000', lineWidth: 2 });
+    }
+    if (results.rightHandLandmarks) {
+        drawConnectors(canvasCtx, results.rightHandLandmarks, HAND_CONNECTIONS, { color: '#00FF00', lineWidth: 5 });
+        drawLandmarks(canvasCtx, results.rightHandLandmarks, { color: '#FF0000', lineWidth: 2 });
+    }
 
-    // Use the client-side dummy AI model for prediction
-    // MediaPipe landmarks are already in the format needed [x, y, z] for each landmark
-    // so no need for .map(l => [l.x, l.y, l.z])
+    // Use our SignRecognizer (hybrid model) for prediction
     const prediction = aiModelInstance.predict(currentUserId, results.leftHandLandmarks, results.rightHandLandmarks);
 
     if (prediction.sign) {
         updateResultCard(prediction.sign.replace(/_/g, ' '), prediction.confidence, prediction.alternatives, prediction.phrase_completion);
 
-        const textToSpeak = prediction.phrase_completion || prediction.sign.replace(/_/g, ' ');
-
-        if (textToSpeak && textToSpeak !== lastSpokenText && prediction.confidence > 60) {
-            speakText(textToSpeak);
-            lastSpokenText = textToSpeak;
-        }
-
-        if (prediction.sign !== 'No Hand Detected' && prediction.sign !== 'Ready to start...' && prediction.sign !== currentSign) {
-            signsDetectedCount++;
-            totalConfidenceSum += prediction.confidence;
-            if (prediction.phrase_completion) {
-                phrasesCompletedCount++;
-            }
-            updateSessionStats();
-        }
-        currentSign = prediction.sign;
-    }
-});
-
-
-// --- Webcam Control ---
-async function startWebcam() {
-    try {
-        mediaStream = await navigator.mediaDevices.getUserMedia({ video: true });
-        videoElement.srcObject = mediaStream;
-        videoElement.play();
-        videoElement.onloadedmetadata = () => {
-            canvasElement.width = videoElement.videoWidth;
-            canvasElement.height = videoElement.videoHeight;
-        };
-
-        const camera = new Camera(videoElement, {
-            onFrame: async () => {
-                await holistic.send({ image: videoElement });
-            },
-            width: 640,
-            height: 480
-        });
-        camera.start();
-
-        sessionStartTime = Date.now();
-        sessionTimerInterval = setInterval(updateSessionStats, 1000);
-
-        startBtn.disabled = true;
-        stopBtn.disabled = false;
-        updateStatus(true);
-    } catch (err) {
-        console.error("Error accessing webcam:", err);
-        updateStatus(false);
-        alert("Could not access webcam. Please ensure it's connected and permissions are granted. Error: " + err.message);
-    }
-}
-
-function stopWebcam() {
-    if (mediaStream) {
-        mediaStream.getTracks().forEach(track => track.stop());
-        videoElement.srcObject = null;
-        mediaStream = null;
-    }
-    if (sessionTimerInterval) {
-        clearInterval(sessionTimerInterval);
-    }
-    sessionStartTime = null;
-    signsDetectedCount = 0;
-    totalConfidenceSum = 0;
-    phrasesCompletedCount = 0;
-    updateSessionStats();
-
-    startBtn.disabled = false;
-    stopBtn.disabled = true;
-    updateStatus(false);
-    updateResultCard("Ready to start...", 0);
-}
-
-// --- Event Listeners ---
-startBtn.addEventListener('click', startWebcam);
-stopBtn.addEventListener('click', stopWebcam);
-speakBtn.addEventListener('click', () => {
-    const textToSpeak = currentSign;
-    if (textToSpeak && textToSpeak !== 'Ready to start...' && textToSpeak !== 'No Hand Detected') {
-        speakText(textToSpeak);
-    }
-});
-
-audioBtn.addEventListener('click', () => {
-    const textToSpeak = currentSign;
-    if (textToSpeak && textToSpeak !== 'Ready to start...' && textToSpeak !== 'No Hand Detected') {
-        speakText(textToSpeak);
-    }
-});
-
-volumeSlider.addEventListener('input', (e) => {
-    console.log('Volume set to:', e.target.value);
-});
-
-userSelect.addEventListener('change', (event) => {
-    currentUserId = event.target.value;
-    // Client-side simulation of user profile loading
-    const success = aiModelInstance.loadUserProfile(currentUserId);
-    if (success) {
-        console.log(`Client-side: Switched to user: ${currentUserId}`);
-        updateResultCard(`Switched to ${userSelect.options[userSelect.selectedIndex].text} profile.`, 0);
-    } else {
-        console.warn(`Client-side: Profile ${currentUserId} not found. Using default simulation.`);
-        updateResultCard(`Profile for ${userSelect.options[userSelect.selectedIndex].text} not found. Using default simulation.`, 0);
-    }
-});
-
-
-// --- Practice Mode Logic ---
-practiceBtn.addEventListener('click', () => {
-    const textToGuide = practiceInput.value.trim();
-    if (textToGuide) {
-        // Call the client-side dummy model for guide data
-        const guideData = aiModelInstance.getSignGuide(textToGuide);
-        
-        if (guideData.success) {
-            practiceResults.innerHTML = `
-                <div class="practice-guide">
-                    <div class="guide-title">Guide for: "${textToGuide}"</div>
-                    <div class="guide-description">${guideData.description}</div>
-                    ${guideData.skeleton_data && guideData.skeleton_data.length > 0 ? `
-                        <div class="hand-skeleton" id="livePracticeSkeleton">
-                            <div class="skeleton-overlay"></div>
-                            <canvas id="practiceCanvas" style="position:absolute; top:0; left:0;"></canvas>
-                        </div>
-                    ` : ''}
-                </div>
-            `;
-
-            if (guideData.skeleton_data && guideData.skeleton_data.length > 0) {
-                const practiceCanvas = document.getElementById('practiceCanvas');
-                if (practiceCanvas) {
-                    practiceCanvas.width = videoElement.videoWidth > 0 ? videoElement.videoWidth : 640;
-                    practiceCanvas.height = videoElement.videoHeight > 0 ? videoElement.videoHeight : 480;
-                    const ctx = practiceCanvas.getContext('2d');
-                    ctx.translate(practiceCanvas.width, 0);
-                    ctx.scale(-1, 1);
-                    drawSkeletonOnCanvas(ctx, guideData.skeleton_data, practiceCanvas.width, practiceCanvas.height);
-                }
-            }
-        } else {
-            practiceResults.innerHTML = `<div class="result-card" style="border-left-color: orange;">${guideData.message}</div>`;
-        }
-    } else {
-        practiceResults.innerHTML = `<div class="result-card" style="border-left-color: orange;">Please enter text to get a sign guide.</div>`;
-    }
-});
-
-// Function to draw a hand skeleton on a canvas (for practice guide)
-function drawSkeletonOnCanvas(ctx, landmarks, width, height) {
-    if (!landmarks || landmarks.length === 0) return;
-
-    const points = landmarks.map(lm => ({ x: lm[0] * width, y: lm[1] * height }));
-
-    const connections = [
-        [0, 1], [1, 2], [2, 3], [3, 4], // Thumb
-        [0, 5], [5, 6], [6, 7], [7, 8], // Index finger
-        [9, 10], [10, 11], [11, 12],     // Middle finger
-        [13, 14], [14, 15], [15, 16],    // Ring finger
-        [17, 18], [18, 19], [19, 20],    // Pinky finger
-        [0, 9], [9, 13], [13, 17], [0, 17] // Palm base connections
-    ];
-
-    ctx.clearRect(0, 0, width, height);
-    
-    ctx.strokeStyle = 'blue';
-    ctx.lineWidth = 2;
-    connections.forEach(conn => {
-        const p1 = points[conn[0]];
-        const p2 = points[conn[1]];
-        if (p1 && p2) {
-            ctx.beginPath();
-            ctx.moveTo(p1.x, p1.y);
-            ctx.lineTo(p2.x, p2.y);
-            ctx.stroke();
-        }
-    });
-
-    points.forEach(p => {
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, 5, 0, 2 * Math.PI);
-        ctx.fillStyle = 'red';
-        ctx.fill();
-    });
-}
-
-
-// --- Dataset Population (Dummy) ---
-const dummySigns = [
-    { name: "Hello", emoji: "👋" },
-    { name: "Thank You", emoji: "🙏" },
-    { name: "Yes", emoji: "👍" },
-    { name: "No", emoji: "👎" },
-    { name: "I Love You", emoji: "🤟" },
-    { name: "Help", emoji: "🆘" },
-    { name: "Water", emoji: "💧" },
-    { name: "Food", emoji: "🍔" },
-    { name: "Good", emoji: "✅" },
-    { name: "Bad", emoji: "❌" },
-    { name: "More", emoji: "➕" },
-    { name: "Please", emoji: "🥺" },
-    { name: "Sorry", emoji: "😔" },
-    { name: "Name", emoji: "🏷️" },
-    { name: "Home", emoji: "🏠" },
-    { name: "Friends", emoji: "🤝" },
-    { name: "Learn", emoji: "📚" }
-];
-
-function populateDatasetGrid() {
-    datasetGrid.innerHTML = '';
-    dummySigns.forEach(sign => {
-        const signCard = document.createElement('div');
-        signCard.className = 'sign-card';
-        signCard.innerHTML = `
-            <div class="sign-emoji">${sign.emoji}</div>
-            <div class="sign-name">${sign.name}</div>
-        `;
-        signCard.addEventListener('click', () => {
-            practiceInput.value = sign.name;
-            practiceBtn.click();
-        });
-        datasetGrid.appendChild(signCard);
-    });
-}
-
-// --- Floating Particles Effect ---
-function createParticles() {
-    const container = document.querySelector('.floating-particles');
-    for (let i = 0; i < 30; i++) {
-        const particle = document.createElement('div');
-        particle.className = 'particle';
-        const size = Math.random() * 15 + 5;
-        particle.style.width = `${size}px`;
-        particle.style.height = `${size}px`;
-        particle.style.left = `${Math.random() * 100}%`;
-        particle.style.top = `${Math.random() * 100}%`;
-        particle.style.animationDuration = `${Math.random() * 10 + 5}s`;
-        particle.style.animationDelay = `${Math.random() * 5}s`;
-        container.appendChild(particle);
-    }
-}
-
-// --- Initial Setup ---
-document.addEventListener('DOMContentLoaded', () => {
-    updateStatus(false);
-    populateDatasetGrid();
-    createParticles();
-    holistic.initialize();
-    updateSessionStats();
-});
+        const textToSpeak
